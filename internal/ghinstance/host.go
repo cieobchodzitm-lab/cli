@@ -90,9 +90,34 @@ func GistHost(hostname string) string {
 	return fmt.Sprintf("gist.%s/", hostname)
 }
 
+// UserAssetUploadPrefix returns the URL prefix for user asset uploads.
+// GHES does not support this endpoint.
+func UserAssetUploadPrefix(hostname string) string {
+	if strings.EqualFold(hostname, localhost) {
+		return fmt.Sprintf("http://uploads.%s/", hostname)
+	}
+	return fmt.Sprintf("https://uploads.%s/", hostname)
+}
+
 func HostPrefix(hostname string) string {
 	if strings.EqualFold(hostname, localhost) {
 		return fmt.Sprintf("http://%s/", hostname)
 	}
 	return fmt.Sprintf("https://%s/", hostname)
+}
+
+func CategorizeHost(host string) string {
+	if host == defaultHostname {
+		return "github.com"
+	}
+
+	if ghauth.IsEnterprise(host) {
+		return "ghes"
+	}
+
+	if ghauth.IsTenancy(host) {
+		return "tenancy"
+	}
+
+	return "uncategorized"
 }

@@ -311,7 +311,7 @@ func Test_logoutRun_tty(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			cfg, readConfigs := config.NewIsolatedTestConfig(t)
+			cfg, readConfigs := config.NewIsolatedTestConfig(t, "")
 
 			for _, hostUsers := range tt.cfgHosts {
 				for _, user := range hostUsers.users {
@@ -506,7 +506,7 @@ func Test_logoutRun_nontty(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			cfg, readConfigs := config.NewIsolatedTestConfig(t)
+			cfg, readConfigs := config.NewIsolatedTestConfig(t, "")
 
 			for _, hostUsers := range tt.cfgHosts {
 				for _, user := range hostUsers.users {
@@ -556,7 +556,7 @@ func hasNoToken(hostname string) tokenAssertion {
 	return func(t *testing.T, cfg gh.Config) {
 		t.Helper()
 
-		token, _ := cfg.Authentication().ActiveToken(hostname)
+		token := cfg.Authentication().ActiveToken(hostname).Token
 		require.Empty(t, token)
 	}
 }
@@ -565,7 +565,7 @@ func hasActiveToken(hostname string, expectedToken string) tokenAssertion {
 	return func(t *testing.T, cfg gh.Config) {
 		t.Helper()
 
-		token, _ := cfg.Authentication().ActiveToken(hostname)
+		token := cfg.Authentication().ActiveToken(hostname).Token
 		require.Equal(t, expectedToken, token)
 	}
 }

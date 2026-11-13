@@ -18,6 +18,7 @@ import (
 	"github.com/MakeNowJust/heredoc"
 	"github.com/cli/cli/v2/api"
 	"github.com/cli/cli/v2/internal/gh"
+	"github.com/cli/cli/v2/internal/gh/ghtelemetry"
 	"github.com/cli/cli/v2/internal/ghinstance"
 	"github.com/cli/cli/v2/internal/ghrepo"
 	"github.com/cli/cli/v2/pkg/cmd/factory"
@@ -34,12 +35,14 @@ const (
 )
 
 type ApiOptions struct {
-	AppVersion string
-	BaseRepo   func() (ghrepo.Interface, error)
-	Branch     func() (string, error)
-	Config     func() (gh.Config, error)
-	HttpClient func() (*http.Client, error)
-	IO         *iostreams.IOStreams
+	AppVersion        string
+	InvokingAgent     string
+	BaseRepo          func() (ghrepo.Interface, error)
+	Branch            func() (string, error)
+	Config            func() (gh.Config, error)
+	HttpClient        func(api.HTTPClientOptions) (*http.Client, error)
+	IO                *iostreams.IOStreams
+	TelemetryDisabler ghtelemetry.Disabler
 
 	Hostname            string
 	RequestMethod       string
@@ -58,15 +61,20 @@ type ApiOptions struct {
 	CacheTTL            time.Duration
 	FilterOutput        string
 	Verbose             bool
+
+	AllowEscapeSequences bool
 }
 
 func NewCmdApi(f *cmdutil.Factory, runF func(*ApiOptions) error) *cobra.Command {
 	opts := ApiOptions{
-		AppVersion: f.AppVersion,
-		BaseRepo:   f.BaseRepo,
-		Branch:     f.Branch,
-		Config:     f.Config,
-		IO:         f.IOStreams,
+		AppVersion:        f.AppVersion,
+		InvokingAgent:     f.InvokingAgent,
+		BaseRepo:          f.BaseRepo,
+		Branch:            f.Branch,
+		Config:            f.Config,
+		HttpClient:        api.NewHTTPClient,
+		IO:                f.IOStreams,
+		TelemetryDisabler: f.TelemetryDisabler,
 	}
 
 	cmd := &cobra.Command{
@@ -211,17 +219,19 @@ func NewCmdApi(f *cmdutil.Factory, runF func(*ApiOptions) error) *cobra.Command 
 		Annotations: map[string]string{
 			"help:environment": heredoc.Docf(`
 				GH_TOKEN, GITHUB_TOKEN (in order of precedence): an authentication token for
-				%[1]sgithub.com%[1]s API requests.
+				API requests to %[1]sgithub.com%[1]s, a subdomain of %[1]sghe.com%[1]s, or %[1]sgithub.localhost%[1]s.
 
 				GH_ENTERPRISE_TOKEN, GITHUB_ENTERPRISE_TOKEN (in order of precedence): an
-				authentication token for API requests to GitHub Enterprise.
+				authentication token for API requests to GitHub Enterprise Server. %[1]sgh%[1]s treats
+				any host other than %[1]sgithub.com%[1]s, a subdomain of %[1]sghe.com%[1]s, or
+				%[1]sgithub.localhost%[1]s as a GitHub Enterprise Server host.
 
 				GH_HOST: make the request to a GitHub host other than %[1]sgithub.com%[1]s.
 			`, "`"),
 		},
 		Args: cobra.ExactArgs(1),
 		PreRun: func(c *cobra.Command, args []string) {
-			opts.BaseRepo = cmdutil.OverrideBaseRepoFunc(f, "")
+			opts.BaseRepo = cmdutil.OverrideBaseRepoFunc(f.BaseRepo, "")
 		},
 		RunE: func(c *cobra.Command, args []string) error {
 			opts.RequestPath = args[0]
@@ -296,6 +306,7 @@ func NewCmdApi(f *cmdutil.Factory, runF func(*ApiOptions) error) *cobra.Command 
 	cmd.Flags().StringVarP(&opts.FilterOutput, "jq", "q", "", "Query to select values from the response using jq syntax")
 	cmd.Flags().DurationVar(&opts.CacheTTL, "cache", 0, "Cache the response, e.g. \"3600s\", \"60m\", \"1h\"")
 	cmd.Flags().BoolVar(&opts.Verbose, "verbose", false, "Include full HTTP request and response in the output")
+	cmd.Flags().BoolVar(&opts.AllowEscapeSequences, "allow-escape-sequences", false, "Allow printing terminal escape sequences")
 	return cmd
 }
 
@@ -312,7 +323,7 @@ func apiRun(opts *ApiOptions) error {
 	}
 	method := opts.RequestMethod
 	requestHeaders := opts.RequestHeaders
-	var requestBody interface{}
+	var requestBody any
 	if len(params) > 0 {
 		requestBody = params
 	}
@@ -329,7 +340,13 @@ func apiRun(opts *ApiOptions) error {
 		}
 	}
 
-	var bodyWriter io.Writer = opts.IO.Out
+	// Response content funnels through ContentOut. It stays in passthrough here:
+	// JSON is sanitized by the transport and the jq/template/jsoncolor paths emit
+	// our own formatting, so only a raw non-JSON body needs neutralizing, done at
+	// its copy below.
+	opts.IO.SetContentSanitization(false)
+
+	var bodyWriter io.Writer = opts.IO.ContentOut
 	var headersWriter io.Writer = opts.IO.Out
 	if opts.Silent {
 		bodyWriter = io.Discard
@@ -378,24 +395,23 @@ func apiRun(opts *ApiOptions) error {
 	}
 
 	if opts.HttpClient == nil {
-		opts.HttpClient = func() (*http.Client, error) {
-			log := opts.IO.ErrOut
-			if opts.Verbose {
-				log = opts.IO.Out
-			}
-			opts := api.HTTPClientOptions{
-				AppVersion:     opts.AppVersion,
-				CacheTTL:       opts.CacheTTL,
-				Config:         cfg.Authentication(),
-				EnableCache:    opts.CacheTTL > 0,
-				Log:            log,
-				LogColorize:    opts.IO.ColorEnabled(),
-				LogVerboseHTTP: opts.Verbose,
-			}
-			return api.NewHTTPClient(opts)
-		}
+		opts.HttpClient = api.NewHTTPClient
 	}
-	httpClient, err := opts.HttpClient()
+	log := opts.IO.ErrOut
+	if opts.Verbose {
+		log = opts.IO.Out
+	}
+	httpClient, err := opts.HttpClient(api.HTTPClientOptions{
+		AppVersion:        opts.AppVersion,
+		InvokingAgent:     opts.InvokingAgent,
+		CacheTTL:          opts.CacheTTL,
+		RefreshingConfig:  cfg.Authentication(),
+		EnableCache:       opts.CacheTTL > 0,
+		Log:               log,
+		LogColorize:       opts.IO.ColorEnabled(),
+		LogVerboseHTTP:    opts.Verbose,
+		TelemetryDisabler: opts.TelemetryDisabler,
+	})
 	if err != nil {
 		return err
 	}
@@ -406,6 +422,8 @@ func apiRun(opts *ApiOptions) error {
 		host = opts.Hostname
 	}
 
+	apiHost, _ := cfg.Authentication().APIHostForHost(host)
+
 	tmpl := template.New(bodyWriter, opts.IO.TerminalWidth(), opts.IO.ColorEnabled())
 	err = tmpl.Parse(opts.Template)
 	if err != nil {
@@ -415,7 +433,7 @@ func apiRun(opts *ApiOptions) error {
 	isFirstPage := true
 	hasNextPage := true
 	for hasNextPage {
-		resp, err := httpRequest(httpClient, host, method, requestPath, requestBody, requestHeaders)
+		resp, err := httpRequest(httpClient, host, apiHost, method, requestPath, requestBody, requestHeaders)
 		if err != nil {
 			return err
 		}
@@ -456,6 +474,8 @@ func apiRun(opts *ApiOptions) error {
 	return tmpl.Flush()
 }
 
+var jsonContentTypeRE = regexp.MustCompile(`[/+]json(;|$)`)
+
 func processResponse(resp *http.Response, opts *ApiOptions, bodyWriter, headersWriter io.Writer, template *template.Template, isFirstPage, isLastPage bool) (endCursor string, err error) {
 	if opts.ShowResponseHeaders {
 		fmt.Fprintln(headersWriter, resp.Proto, resp.Status)
@@ -469,7 +489,7 @@ func processResponse(resp *http.Response, opts *ApiOptions, bodyWriter, headersW
 	var responseBody io.Reader = resp.Body
 	defer resp.Body.Close()
 
-	isJSON, _ := regexp.MatchString(`[/+]json(;|$)`, resp.Header.Get("Content-Type"))
+	isJSON := jsonContentTypeRE.MatchString(resp.Header.Get("Content-Type"))
 
 	var serverError string
 	if isJSON && (opts.RequestPath == "graphql" || resp.StatusCode >= 400) {
@@ -513,7 +533,20 @@ func processResponse(resp *http.Response, opts *ApiOptions, bodyWriter, headersW
 				isLastPage:  isLastPage,
 			}
 		}
-		_, err = io.Copy(bodyWriter, responseBody)
+		// A raw non-JSON body is the only response the transport does not sanitize.
+		// It is faithful byte output, so binary bound for a terminal and text
+		// carrying escape sequences are refused; the opt-out flag and discarded
+		// output stream verbatim.
+		if !isJSON && !opts.AllowEscapeSequences && bodyWriter != io.Discard {
+			err = iostreams.CopyGuardedContent(bodyWriter, responseBody, opts.IO.IsStdoutTTY())
+			if binErr, ok := errors.AsType[iostreams.BinaryTerminalError](err); ok {
+				err = fmt.Errorf("%w; redirect or pipe stdout to save it, or pass --allow-escape-sequences to output it anyway", binErr)
+			} else if errors.Is(err, iostreams.ErrEscapeSequence) {
+				err = errors.New("the response contains terminal escape sequences; pass --allow-escape-sequences to output it anyway")
+			}
+		} else {
+			_, err = io.Copy(bodyWriter, responseBody)
+		}
 	}
 	if err != nil {
 		return

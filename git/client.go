@@ -46,6 +46,7 @@ var remoteRE = regexp.MustCompile(`(.+)\s+(.+)\s+\((push|fetch)\)`)
 var commitLogRE = regexp.MustCompile(`(?m)^[0-9a-fA-F]{7,40}\x00.*?\x00[\S\s]*?\x00$`)
 
 type errWithExitCode interface {
+	error
 	ExitCode() int
 }
 
@@ -57,8 +58,7 @@ type Client struct {
 	Stdin   io.Reader
 	Stdout  io.Writer
 
-	commandContext commandCtx
-	mu             sync.Mutex
+	mu sync.Mutex
 }
 
 func (c *Client) Copy() *Client {
@@ -69,18 +69,12 @@ func (c *Client) Copy() *Client {
 		Stderr:  c.Stderr,
 		Stdin:   c.Stdin,
 		Stdout:  c.Stdout,
-
-		commandContext: c.commandContext,
 	}
 }
 
 func (c *Client) Command(ctx context.Context, args ...string) (*Command, error) {
 	if c.RepoDir != "" {
 		args = append([]string{"-C", c.RepoDir}, args...)
-	}
-	commandContext := exec.CommandContext
-	if c.commandContext != nil {
-		commandContext = c.commandContext
 	}
 	var err error
 	c.mu.Lock()
@@ -91,7 +85,7 @@ func (c *Client) Command(ctx context.Context, args ...string) (*Command, error) 
 	if err != nil {
 		return nil, err
 	}
-	cmd := commandContext(ctx, c.GitPath, args...)
+	cmd := exec.CommandContext(ctx, c.GitPath, args...)
 	cmd.Stderr = c.Stderr
 	cmd.Stdin = c.Stdin
 	cmd.Stdout = c.Stdout
@@ -106,7 +100,7 @@ func (c *Client) Command(ctx context.Context, args ...string) (*Command, error) 
 // It is only usable when constructed by another function in the package because the empty pattern,
 // without allMatching set to true, will result in an error in AuthenticatedCommand.
 //
-// Callers can currently opt-in to an slightly less secure mode for backwards compatibility by using
+// Callers can currently opt-in to a slightly less secure mode for backwards compatibility by using
 // AllMatchingCredentialsPattern.
 type CredentialPattern struct {
 	allMatching bool // should only be constructable via AllMatchingCredentialsPattern
@@ -261,6 +255,68 @@ func (c *Client) ShowRefs(ctx context.Context, refs []string) ([]Ref, error) {
 		})
 	}
 	return verified, err
+}
+
+// Worktrees lists the repository's worktrees by parsing the output of
+// `git worktree list --porcelain`.
+func (c *Client) Worktrees(ctx context.Context) ([]Worktree, error) {
+	cmd, err := c.Command(ctx, "worktree", "list", "--porcelain")
+	if err != nil {
+		return nil, err
+	}
+	out, err := cmd.Output()
+	if err != nil {
+		return nil, err
+	}
+	return parseWorktrees(out), nil
+}
+
+// WorktreeRemove removes the worktree at the given path via
+// `git worktree remove <path>`.
+func (c *Client) WorktreeRemove(ctx context.Context, path string) error {
+	cmd, err := c.Command(ctx, "worktree", "remove", "--", path)
+	if err != nil {
+		return err
+	}
+	_, err = cmd.Output()
+	return err
+}
+
+// WorktreePrune removes administrative files for worktrees that no longer
+// exist on disk.
+func (c *Client) WorktreePrune(ctx context.Context) error {
+	cmd, err := c.Command(ctx, "worktree", "prune")
+	if err != nil {
+		return err
+	}
+	_, err = cmd.Output()
+	return err
+}
+
+// parseWorktrees parses the output of `git worktree list --porcelain` into a
+// slice of Worktree. Each record begins with a "worktree <path>" line followed
+// by attribute lines.
+func parseWorktrees(output []byte) []Worktree {
+	var worktrees []Worktree
+	output = bytes.ReplaceAll(output, []byte("\r\n"), []byte("\n"))
+	for record := range strings.SplitSeq(string(output), "\n\n") {
+		var worktree Worktree
+		for line := range strings.SplitSeq(record, "\n") {
+			key, value, _ := strings.Cut(line, " ")
+			switch key {
+			case "worktree":
+				worktree.Path = value
+			case "branch":
+				worktree.Ref = value
+			case "prunable":
+				worktree.Prunable = true
+			}
+		}
+		if worktree.Path != "" {
+			worktrees = append(worktrees, worktree)
+		}
+	}
+	return worktrees
 }
 
 func (c *Client) Config(ctx context.Context, name string) (string, error) {
@@ -581,6 +637,10 @@ func (c *Client) PushRevision(ctx context.Context, branch string) (RemoteTrackin
 		return RemoteTrackingRef{}, err
 	}
 
+	return parsePushRevision(revParseOut)
+}
+
+func parsePushRevision(revParseOut []byte) (RemoteTrackingRef, error) {
 	ref, err := ParseRemoteTrackingRef(firstLine(revParseOut))
 	if err != nil {
 		return RemoteTrackingRef{}, fmt.Errorf("could not parse push revision: %v", err)
@@ -711,6 +771,47 @@ func (c *Client) IsLocalGitRepo(ctx context.Context) (bool, error) {
 		return false, err
 	}
 	return true, nil
+}
+
+// RemoteURL returns the fetch URL configured for the named remote.
+func (c *Client) RemoteURL(ctx context.Context, name string) (string, error) {
+	cmd, err := c.Command(ctx, "remote", "get-url", "--", name)
+	if err != nil {
+		return "", err
+	}
+	out, err := cmd.Output()
+	if err != nil {
+		return "", err
+	}
+	return firstLine(out), nil
+}
+
+// IsIgnored reports whether the given path is ignored by .gitignore rules.
+// Returns an error for fatal git failures (e.g. path outside repository).
+func (c *Client) IsIgnored(ctx context.Context, path string) (bool, error) {
+	cmd, err := c.Command(ctx, "check-ignore", "-q", "--", path)
+	if err != nil {
+		return false, err
+	}
+	_, err = cmd.Output()
+	if err == nil {
+		return true, nil
+	}
+	// Exit 1 here means we can confirm the path is not ignored.
+	// Any other error is a real git error.
+	var exitErr *exec.ExitError
+	if errors.As(err, &exitErr) && exitErr.ExitCode() == 1 {
+		return false, nil
+	}
+	return false, err
+}
+
+// ShortSHA returns the first 8 characters of a SHA hash for display purposes.
+func ShortSHA(sha string) string {
+	if len(sha) > 8 {
+		return sha[:8]
+	}
+	return sha
 }
 
 func (c *Client) UnsetRemoteResolution(ctx context.Context, name string) error {

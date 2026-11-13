@@ -8,10 +8,8 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
-	"time"
 
 	"github.com/cli/cli/v2/api"
-	fd "github.com/cli/cli/v2/internal/featuredetection"
 	"github.com/cli/cli/v2/internal/ghrepo"
 	o "github.com/cli/cli/v2/pkg/option"
 	"github.com/cli/cli/v2/pkg/set"
@@ -138,18 +136,6 @@ func FindIssuesOrPRs(httpClient *http.Client, repo ghrepo.Interface, issueNumber
 func FindIssueOrPR(httpClient *http.Client, repo ghrepo.Interface, number int, fields []string) (*api.Issue, error) {
 	fieldSet := set.NewStringSet()
 	fieldSet.AddValues(fields)
-	if fieldSet.Contains("stateReason") {
-		cachedClient := api.NewCachedHTTPClient(httpClient, time.Hour*24)
-		detector := fd.NewDetector(cachedClient, repo.RepoHost())
-		features, err := detector.IssueFeatures()
-		if err != nil {
-			return nil, err
-		}
-		// TODO stateReasonCleanup
-		if !features.StateReason {
-			fieldSet.Remove("stateReason")
-		}
-	}
 
 	var getProjectItems bool
 	if fieldSet.Contains("projectItems") {
@@ -179,7 +165,7 @@ func FindIssueOrPR(httpClient *http.Client, repo ghrepo.Interface, number int, f
 		}
 	}`, api.IssueGraphQL(fields), api.PullRequestGraphQL(fields))
 
-	variables := map[string]interface{}{
+	variables := map[string]any{
 		"owner":  repo.RepoOwner(),
 		"repo":   repo.RepoName(),
 		"number": number,
@@ -188,8 +174,7 @@ func FindIssueOrPR(httpClient *http.Client, repo ghrepo.Interface, number int, f
 	var resp response
 	client := api.NewClientFromHTTP(httpClient)
 	if err := client.GraphQL(repo.RepoHost(), query, variables, &resp); err != nil {
-		var gerr api.GraphQLError
-		if errors.As(err, &gerr) {
+		if gerr, ok := errors.AsType[api.GraphQLError](err); ok {
 			if gerr.Match("NOT_FOUND", "repository.issue") && !resp.Repository.HasIssuesEnabled {
 				return nil, fmt.Errorf("the '%s' repository has disabled issues", ghrepo.FullName(repo))
 			} else if gerr.Match("FORBIDDEN", "repository.issue.projectCards.") {
@@ -221,4 +206,43 @@ func FindIssueOrPR(httpClient *http.Client, repo ghrepo.Interface, number int, f
 	}
 
 	return resp.Repository.Issue, nil
+}
+
+// ResolveIssueRef parses an issue reference (number or URL) and returns its
+// node ID. References that point at a different host than baseRepo are
+// rejected because relationship mutations require IDs from the base host.
+func ResolveIssueRef(client *api.Client, baseRepo ghrepo.Interface, ref string) (string, error) {
+	number, repo, err := ParseIssueFromArg(ref)
+	if err != nil {
+		return "", err
+	}
+
+	targetRepo := baseRepo
+	if r, ok := repo.Value(); ok {
+		if r.RepoHost() != baseRepo.RepoHost() {
+			return "", fmt.Errorf("issue reference %q belongs to a different host (%s) than the current repository (%s)", ref, r.RepoHost(), baseRepo.RepoHost())
+		}
+		targetRepo = r
+	}
+
+	return api.IssueNodeID(client, targetRepo, number)
+}
+
+// ResolveIssueTypeName resolves an issue type name to its node ID by
+// fetching the repository's available types.
+func ResolveIssueTypeName(client *api.Client, repo ghrepo.Interface, typeName string) (string, error) {
+	issueTypes, err := api.RepoIssueTypes(client, repo)
+	if err != nil {
+		return "", err
+	}
+
+	typeNames := make([]string, len(issueTypes))
+	for i, t := range issueTypes {
+		typeNames[i] = t.Name
+		if strings.EqualFold(t.Name, typeName) {
+			return t.ID, nil
+		}
+	}
+
+	return "", fmt.Errorf("type %q not found; available types: %s", typeName, strings.Join(typeNames, ", "))
 }

@@ -2,15 +2,13 @@ package git
 
 import (
 	"bytes"
-	"context"
 	"errors"
 	"io"
 	"os/exec"
+	"slices"
 
 	"github.com/cli/cli/v2/internal/run"
 )
-
-type commandCtx = func(ctx context.Context, name string, args ...string) *exec.Cmd
 
 type Command struct {
 	*exec.Cmd
@@ -26,8 +24,7 @@ func (gc *Command) Run() error {
 	err := run.PrepareCmd(gc.Cmd).Run()
 	if err != nil {
 		ge := GitError{err: err, Stderr: stderr.String()}
-		var exitError *exec.ExitError
-		if errors.As(err, &exitError) {
+		if exitError, ok := errors.AsType[*exec.ExitError](err); ok {
 			ge.ExitCode = exitError.ExitCode()
 		}
 		return &ge
@@ -50,13 +47,11 @@ func (gc *Command) Output() ([]byte, error) {
 		// is not a method and so tests can't access it.
 		// THIS MEANS THAT TESTS WILL NOT CORRECTLY HAVE STDERR SET,
 		// but at least tests can get the exit code.
-		var exitErrorWithExitCode errWithExitCode
-		if errors.As(err, &exitErrorWithExitCode) {
+		if exitErrorWithExitCode, ok := errors.AsType[errWithExitCode](err); ok {
 			ge.ExitCode = exitErrorWithExitCode.ExitCode()
 		}
 
-		var exitError *exec.ExitError
-		if errors.As(err, &exitError) {
+		if exitError, ok := errors.AsType[*exec.ExitError](err); ok {
 			ge.Stderr = string(exitError.Stderr)
 		}
 		err = &ge
@@ -65,22 +60,11 @@ func (gc *Command) Output() ([]byte, error) {
 }
 
 func (gc *Command) setRepoDir(repoDir string) {
-	for i, arg := range gc.Args {
-		if arg == "-C" {
-			gc.Args[i+1] = repoDir
-			return
-		}
+	if len(gc.Args) >= 3 && gc.Args[1] == "-C" {
+		gc.Args[2] = repoDir
+		return
 	}
-	// Handle "--" invocations for testing purposes.
-	var index int
-	for i, arg := range gc.Args {
-		if arg == "--" {
-			index = i + 1
-		}
-	}
-	gc.Args = append(gc.Args[:index+3], gc.Args[index+1:]...)
-	gc.Args[index+1] = "-C"
-	gc.Args[index+2] = repoDir
+	gc.Args = slices.Insert(gc.Args, 1, "-C", repoDir)
 }
 
 // Allow individual commands to be modified from the default client options.

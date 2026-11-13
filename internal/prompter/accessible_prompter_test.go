@@ -1,10 +1,11 @@
-//go:build !windows
+//go:build linux || darwin
 
 package prompter_test
 
 import (
 	"fmt"
 	"io"
+	"os"
 	"slices"
 	"strings"
 	"testing"
@@ -17,6 +18,7 @@ import (
 	"github.com/hinshun/vt10x"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"golang.org/x/sys/unix"
 )
 
 // The following tests are broadly testing the accessible prompter, and NOT asserting
@@ -33,8 +35,6 @@ import (
 // are sufficient to ensure that the accessible prompter behaves roughly as expected
 // but doesn't mandate that prompts always look exactly the same.
 func TestAccessiblePrompter(t *testing.T) {
-
-	beforePasswordSendTimeout := 100 * time.Microsecond
 
 	t.Run("Select", func(t *testing.T) {
 		console := newTestVirtualTerminal(t)
@@ -109,7 +109,7 @@ func TestAccessiblePrompter(t *testing.T) {
 
 		go func() {
 			// Wait for prompt to appear without the invalid default value
-			_, err := console.ExpectString("Select a number \r\n")
+			_, err := console.ExpectString("Select a number")
 			require.NoError(t, err)
 
 			// Select option 2
@@ -128,7 +128,7 @@ func TestAccessiblePrompter(t *testing.T) {
 
 		go func() {
 			// Wait for prompt to appear
-			_, err := console.ExpectString("Input a number between 0 and 3:")
+			_, err := console.ExpectString("Enter a number between 0 and 3:")
 			require.NoError(t, err)
 
 			// Select options 1 and 2
@@ -207,7 +207,7 @@ func TestAccessiblePrompter(t *testing.T) {
 
 		go func() {
 			// Wait for prompt to appear without the invalid default values
-			_, err := console.ExpectString("Select a number \r\n")
+			_, err := console.ExpectString("Select a number")
 			require.NoError(t, err)
 
 			// Not selecting anything will fail because there are no defaults.
@@ -259,7 +259,7 @@ func TestAccessiblePrompter(t *testing.T) {
 
 		go func() {
 			// Wait for prompt to appear
-			_, err := console.ExpectString("Select an option \r\n")
+			_, err := console.ExpectString("Select an option")
 			require.NoError(t, err)
 
 			// Select the search option, which will always be the first option
@@ -279,7 +279,7 @@ func TestAccessiblePrompter(t *testing.T) {
 			require.NoError(t, err)
 
 			// Wait for the multiselect prompt to re-appear after search
-			_, err = console.ExpectString("Select an option \r\n")
+			_, err = console.ExpectString("Select an option")
 			require.NoError(t, err)
 
 			// Select the first search result
@@ -325,7 +325,7 @@ func TestAccessiblePrompter(t *testing.T) {
 
 		go func() {
 			// Wait for prompt to appear
-			_, err := console.ExpectString("Select an option (default: Initial Result Label 1) \r\n")
+			_, err := console.ExpectString("Select an option (default: Initial Result Label 1)")
 			require.NoError(t, err)
 
 			// This confirms default selections
@@ -379,7 +379,7 @@ func TestAccessiblePrompter(t *testing.T) {
 
 		go func() {
 			// Wait for prompt to appear
-			_, err := console.ExpectString("Select an option \r\n")
+			_, err := console.ExpectString("Select an option")
 			require.NoError(t, err)
 
 			// Select one of our initial search results
@@ -505,8 +505,8 @@ func TestAccessiblePrompter(t *testing.T) {
 			_, err := console.ExpectString("Enter password")
 			require.NoError(t, err)
 
-			// Wait to ensure huh has time to set the echo mode
-			time.Sleep(beforePasswordSendTimeout)
+			// Wait until huh has disabled echo mode on the TTY
+			require.NoError(t, waitForEchoDisabled(console.Tty(), 5*time.Second))
 
 			// Enter a number
 			_, err = console.SendLine(dummyPassword)
@@ -524,7 +524,7 @@ func TestAccessiblePrompter(t *testing.T) {
 		// expected string matches any part of the stream, we have to use an
 		// anchored regexp (i.e., with ^ and $) to make sure the password/token
 		// is not printed at all.
-		_, err = console.Expect(expect.RegexpPattern("^ \r\n\r\n$"))
+		_, err = console.Expect(expect.RegexpPattern(`^(\x1b\[[\d;]*m)* \r\n\r\n$`))
 		require.NoError(t, err)
 	})
 
@@ -596,8 +596,8 @@ func TestAccessiblePrompter(t *testing.T) {
 			_, err := console.ExpectString("Paste your authentication token:")
 			require.NoError(t, err)
 
-			// Wait to ensure huh has time to set the echo mode
-			time.Sleep(beforePasswordSendTimeout)
+			// Wait until huh has disabled echo mode on the TTY
+			require.NoError(t, waitForEchoDisabled(console.Tty(), 5*time.Second))
 
 			// Enter some dummy auth token
 			_, err = console.SendLine(dummyAuthToken)
@@ -615,7 +615,7 @@ func TestAccessiblePrompter(t *testing.T) {
 		// expected string matches any part of the stream, we have to use an
 		// anchored regexp (i.e., with ^ and $) to make sure the password/token
 		// is not printed at all.
-		_, err = console.Expect(expect.RegexpPattern("^ \r\n\r\n$"))
+		_, err = console.Expect(expect.RegexpPattern(`^(\x1b\[[\d;]*m)* \r\n\r\n$`))
 		require.NoError(t, err)
 	})
 
@@ -641,8 +641,8 @@ func TestAccessiblePrompter(t *testing.T) {
 			_, err = console.ExpectString("Paste your authentication token:")
 			require.NoError(t, err)
 
-			// Wait to ensure huh has time to set the echo mode
-			time.Sleep(beforePasswordSendTimeout)
+			// Wait until huh has disabled echo mode on the TTY
+			require.NoError(t, waitForEchoDisabled(console.Tty(), 5*time.Second))
 
 			// Now enter some dummy auth token to return control back to the test
 			_, err = console.SendLine(dummyAuthTokenForAfterFailure)
@@ -660,7 +660,7 @@ func TestAccessiblePrompter(t *testing.T) {
 		// expected string matches any part of the stream, we have to use an
 		// anchored regexp (i.e., with ^ and $) to make sure the password/token
 		// is not printed at all.
-		_, err = console.Expect(expect.RegexpPattern("^ \r\n\r\n$"))
+		_, err = console.Expect(expect.RegexpPattern(`^(\x1b\[[\d;]*m)* \r\n\r\n$`))
 		require.NoError(t, err)
 	})
 
@@ -955,4 +955,22 @@ func testCloser(t *testing.T, closer io.Closer) {
 	if err := closer.Close(); err != nil {
 		t.Errorf("Close failed: %s", err)
 	}
+}
+
+// waitForEchoDisabled polls the TTY until echo mode is disabled or the
+// timeout is reached. This is used in password and auth token tests to
+// ensure that huh has configured the terminal before we send input.
+func waitForEchoDisabled(tty *os.File, timeout time.Duration) error {
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		termios, err := unix.IoctlGetTermios(int(tty.Fd()), ioctlGetTermios)
+		if err != nil {
+			return fmt.Errorf("getting terminal attributes: %w", err)
+		}
+		if termios.Lflag&unix.ECHO == 0 {
+			return nil
+		}
+		time.Sleep(time.Millisecond)
+	}
+	return fmt.Errorf("timed out waiting for echo mode to be disabled")
 }
