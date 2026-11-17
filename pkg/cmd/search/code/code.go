@@ -56,6 +56,9 @@ func NewCmdCode(f *cmdutil.Factory, runF func(*CodeOptions) error) *cobra.Comman
 			# Search code matching "error handling"
 			$ gh search code "error handling"
 
+			# Search code using raw search qualifiers as separate arguments
+			$ gh search code panic path:pkg language:go
+
 			# Search code matching "deque" in Python files
 			$ gh search code deque --language=python
 
@@ -100,7 +103,7 @@ func NewCmdCode(f *cmdutil.Factory, runF func(*CodeOptions) error) *cobra.Comman
 	cmd.Flags().StringVar(&opts.Query.Qualifiers.Filename, "filename", "", "Filter on filename")
 	cmdutil.StringSliceEnumFlag(cmd, &opts.Query.Qualifiers.In, "match", "", nil, []string{"file", "path"}, "Restrict search to file contents or file path")
 	cmd.Flags().StringVarP(&opts.Query.Qualifiers.Language, "language", "", "", "Filter results by language")
-	cmd.Flags().StringSliceVarP(&opts.Query.Qualifiers.Repo, "repo", "R", nil, "Filter on repository")
+	cmd.Flags().StringSliceVarP(&opts.Query.Qualifiers.Repo, "repo", "R", nil, "Filter on repository, in `OWNER/REPO` format")
 	cmd.Flags().StringVar(&opts.Query.Qualifiers.Size, "size", "", "Filter on size range, in kilobytes")
 	cmd.Flags().StringSliceVar(&opts.Query.Qualifiers.User, "owner", nil, "Filter on owner")
 
@@ -201,26 +204,35 @@ func formatMatch(t string, matches []search.Match, io *iostreams.IOStreams) []st
 
 	var lines []string
 	var b strings.Builder
-	var found bool
+	var found, highlighting bool
+	// A match can end at a newline or at the end of the fragment, where no
+	// character carries the end index, so close any open highlight here.
+	endLine := func() {
+		if highlighting {
+			b.WriteString(cs.Reset())
+			highlighting = false
+		}
+		if found {
+			lines = append(lines, b.String())
+		}
+		found = false
+		b.Reset()
+	}
 	for i, c := range t {
 		if c == '\n' {
-			if found {
-				lines = append(lines, b.String())
-			}
-			found = false
-			b.Reset()
+			endLine()
 			continue
 		}
 		if _, ok := startIndices[i]; ok {
 			b.WriteString(cs.HighlightStart())
 			found = true
+			highlighting = true
 		} else if _, ok := endIndices[i]; ok {
 			b.WriteString(cs.Reset())
+			highlighting = false
 		}
 		b.WriteRune(c)
 	}
-	if found {
-		lines = append(lines, b.String())
-	}
+	endLine()
 	return lines
 }

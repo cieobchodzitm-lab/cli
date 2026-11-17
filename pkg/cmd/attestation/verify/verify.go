@@ -88,6 +88,15 @@ func NewVerifyCmd(f *cmdutil.Factory, runF func(*Options) error) *cobra.Command 
 			For offline verification using attestations stored on disk (c.f. the download command)
 			provide a path to the %[1]s--bundle%[1]s flag.
 
+			When you load attestations with %[1]s--bundle%[1]s or %[1]s--bundle-from-oci%[1]s, this command
+			compares the %[1]s--repo%[1]s or %[1]s--owner%[1]s value only with the repository and owner
+			names recorded in the attestation's certificate when the attestation was
+			created. It cannot detect whether the repository or owner has since been
+			renamed, or whether a different repository or owner now uses that name. To
+			confirm that an attestation belongs to the repository or owner that currently
+			has the name, omit %[1]s--bundle%[1]s and %[1]s--bundle-from-oci%[1]s so that this command
+			fetches attestations from the GitHub API.
+
 			## Additional Policy Enforcement
 
 			Given the %[1]s--format=json%[1]s flag, upon successful verification this
@@ -173,6 +182,11 @@ func NewVerifyCmd(f *cmdutil.Factory, runF func(*Options) error) *cobra.Command 
 				return err
 			}
 
+			externalClient, err := f.ExternalHttpClient()
+			if err != nil {
+				return err
+			}
+
 			opts.OCIClient = oci.NewLiveClient()
 
 			if opts.Hostname == "" {
@@ -183,13 +197,13 @@ func NewVerifyCmd(f *cmdutil.Factory, runF func(*Options) error) *cobra.Command 
 				return err
 			}
 
-			opts.APIClient = api.NewLiveClient(hc, opts.Hostname, opts.Logger)
+			opts.APIClient = api.NewLiveClient(hc, externalClient, opts.Hostname, opts.Logger)
 
 			config := verification.SigstoreConfig{
-				HttpClient:   hc,
-				Logger:       opts.Logger,
-				NoPublicGood: opts.NoPublicGood,
-				TrustedRoot:  opts.TrustedRoot,
+				ExternalHttpClient: externalClient,
+				Logger:             opts.Logger,
+				NoPublicGood:       opts.NoPublicGood,
+				TrustedRoot:        opts.TrustedRoot,
 			}
 
 			// Prepare for tenancy if detected

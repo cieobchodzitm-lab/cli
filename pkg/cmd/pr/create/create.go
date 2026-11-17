@@ -9,6 +9,7 @@ import (
 	"net/url"
 	"os"
 	"regexp"
+	"slices"
 	"strings"
 	"time"
 
@@ -17,10 +18,13 @@ import (
 	"github.com/cli/cli/v2/api"
 	ghContext "github.com/cli/cli/v2/context"
 	"github.com/cli/cli/v2/git"
+	"github.com/cli/cli/v2/internal/attachments"
 	"github.com/cli/cli/v2/internal/browser"
 	fd "github.com/cli/cli/v2/internal/featuredetection"
 	"github.com/cli/cli/v2/internal/gh"
+	"github.com/cli/cli/v2/internal/gh/ghtelemetry"
 	"github.com/cli/cli/v2/internal/ghrepo"
+	"github.com/cli/cli/v2/internal/prompter"
 	"github.com/cli/cli/v2/internal/text"
 	"github.com/cli/cli/v2/pkg/cmd/pr/shared"
 	"github.com/cli/cli/v2/pkg/cmdutil"
@@ -73,6 +77,11 @@ type CreateOptions struct {
 	Template            string
 
 	DryRun bool
+
+	BodyDir     string
+	AttachFlag  *attachments.Flag
+	AttachEvent *attachments.TelemetryEvent
+	Assets      []attachments.UserAsset
 }
 
 // creationRefs is an interface that provides the necessary information for creating a pull request in the API.
@@ -190,7 +199,7 @@ type CreateContext struct {
 	GitClient          *git.Client
 }
 
-func NewCmdCreate(f *cmdutil.Factory, runF func(*CreateOptions) error) *cobra.Command {
+func NewCmdCreate(f *cmdutil.Factory, telemetry ghtelemetry.InvocationRecorder, runF func(*CreateOptions) error) *cobra.Command {
 	opts := &CreateOptions{
 		IO:               f.IOStreams,
 		HttpClient:       f.HttpClient,
@@ -237,6 +246,21 @@ func NewCmdCreate(f *cmdutil.Factory, runF func(*CreateOptions) error) *cobra.Co
 			request. If the body text mentions %[1]sFixes #123%[1]s or %[1]sCloses #123%[1]s, the referenced issue
 			will automatically get closed when the pull request gets merged.
 
+			Use %[1]s--attach%[1]s to upload an image or video. The attachment is appended to the
+			body. If the body references an attached file, such as %[1]s![alt](./login.png)%[1]s, that
+			reference is rewritten to point at the uploaded asset instead. Paths in a
+			%[1]s--body-file%[1]s are relative to its directory, falling back to the working directory.
+			You can attach up to 50 files per command.
+
+			Alt text for an image follows the path after %[1]s#%[1]s, as in
+			%[1]s--attach './login.png#The login error state'%[1]s. Without it the filename is used.
+			A reference already in the body keeps the alt text written there. Video renders
+			as a player and has no alt text, so it cannot be given any.
+
+			If some attachments upload and others fail, the pull request is still created with the
+			ones that succeeded. The command then exits with a non-zero status, but the new pull
+			request's URL is still printed to stdout.
+
 			By default, users with write access to the base repository can push new commits to the
 			head branch of the pull request. Disable this with %[1]s--no-maintainer-edit%[1]s.
 
@@ -249,6 +273,8 @@ func NewCmdCreate(f *cmdutil.Factory, runF func(*CreateOptions) error) *cobra.Co
 			$ gh pr create --project "Roadmap"
 			$ gh pr create --base develop --head monalisa:feature
 			$ gh pr create --template "pull_request_template.md"
+			$ gh pr create --attach './login.png#The login error state'
+			$ gh pr create --attach ./before.png --attach ./after.png
 		`),
 		Args:    cmdutil.NoArgsQuoteReminder,
 		Aliases: []string{"new"},
@@ -310,11 +336,10 @@ func NewCmdCreate(f *cmdutil.Factory, runF func(*CreateOptions) error) *cobra.Co
 
 			opts.BodyProvided = cmd.Flags().Changed("body")
 			if bodyFile != "" {
-				b, err := cmdutil.ReadFile(bodyFile, opts.IO.In)
+				opts.Body, opts.BodyDir, err = cmdutil.ReadMarkdownBodyFile(bodyFile, opts.IO.In)
 				if err != nil {
 					return err
 				}
-				opts.Body = string(b)
 				opts.BodyProvided = true
 			}
 
@@ -328,6 +353,28 @@ func NewCmdCreate(f *cmdutil.Factory, runF func(*CreateOptions) error) *cobra.Co
 
 			if opts.DryRun && opts.WebMode {
 				return cmdutil.FlagErrorf("`--dry-run` is not supported when using `--web`")
+			}
+
+			if err := cmdutil.MutuallyExclusive(
+				"`--attach` is not supported when using `--web`",
+				opts.AttachFlag.Changed(),
+				opts.WebMode,
+			); err != nil {
+				return err
+			}
+
+			if err := cmdutil.MutuallyExclusive(
+				"`--attach` is not supported when using `--dry-run`",
+				opts.AttachFlag.Changed(),
+				opts.DryRun,
+			); err != nil {
+				return err
+			}
+
+			opts.AttachEvent = attachments.BeginTelemetry(telemetry, cmd.CommandPath(), opts.AttachFlag.Count())
+			opts.Assets, err = opts.AttachFlag.UserAssets()
+			if err != nil {
+				return err
 			}
 
 			if runF != nil {
@@ -358,6 +405,7 @@ func NewCmdCreate(f *cmdutil.Factory, runF func(*CreateOptions) error) *cobra.Co
 	fl.StringVar(&opts.RecoverFile, "recover", "", "Recover input from a failed run of create")
 	fl.StringVarP(&opts.Template, "template", "T", "", "Template `file` to use as starting body text")
 	fl.BoolVar(&opts.DryRun, "dry-run", false, "Print details instead of creating the PR. May still push git changes.")
+	opts.AttachFlag = attachments.AddFlag(cmd)
 
 	_ = cmdutil.RegisterBranchCompletionFlags(f.GitClient, cmd, "base", "head")
 
@@ -398,9 +446,39 @@ func createRun(opts *CreateOptions) error {
 
 	client := ctx.Client
 
-	state, err := NewIssueState(*ctx, *opts)
+	// Detect ApiActorsSupported feature to determine if we can use search-based
+	// reviewer selection (github.com) or need to use legacy ID-based selection (GHES)
+	issueFeatures, err := opts.Detector.IssueFeatures()
 	if err != nil {
 		return err
+	}
+	var reviewerSearchFunc func(string) prompter.MultiSelectSearchResult
+	var assigneeSearchFunc func(string) prompter.MultiSelectSearchResult
+	if issueFeatures.ApiActorsSupported {
+		reviewerSearchFunc = func(query string) prompter.MultiSelectSearchResult {
+			candidates, moreResults, err := api.SuggestedReviewerActorsForRepo(client, ctx.PRRefs.BaseRepo(), query)
+			if err != nil {
+				return prompter.MultiSelectSearchResult{Err: err}
+			}
+			keys := make([]string, len(candidates))
+			labels := make([]string, len(candidates))
+			for i, c := range candidates {
+				keys[i] = c.Login()
+				labels[i] = c.DisplayName()
+			}
+			return prompter.MultiSelectSearchResult{Keys: keys, Labels: labels, MoreResults: moreResults}
+		}
+		assigneeSearchFunc = shared.RepoAssigneeSearchFunc(client, ctx.PRRefs.BaseRepo())
+	}
+
+	state, err := NewIssueState(*ctx, *opts, issueFeatures.ApiActorsSupported)
+	if err != nil {
+		return err
+	}
+
+	// TODO ApiActorsSupported
+	if issueFeatures.ApiActorsSupported {
+		state.ApiActorsSupported = true
 	}
 
 	var openURL string
@@ -451,6 +529,16 @@ func createRun(opts *CreateOptions) error {
 			ctx.PRRefs.QualifiedHeadRef(), ctx.PRRefs.BaseRef(), existingPR.URL)
 	}
 
+	// Built before the prompts, so a run that cannot upload stops early.
+	var uploader *attachments.Uploader
+	if len(opts.Assets) > 0 {
+		baseRepo := ctx.PRRefs.BaseRepo()
+		uploader, err = attachments.NewUploader(httpClient, baseRepo.RepoHost(), baseRepo.DatabaseID, baseRepo.ViewerPermission)
+		if err != nil {
+			return err
+		}
+	}
+
 	message := "\nCreating pull request for %s into %s in %s\n\n"
 	if state.Draft {
 		message = "\nCreating draft pull request for %s into %s in %s\n\n"
@@ -473,7 +561,7 @@ func createRun(opts *CreateOptions) error {
 		if err != nil {
 			return err
 		}
-		return submitPR(*opts, *ctx, *state, projectsV1Support)
+		return submitPR(*opts, *ctx, *state, projectsV1Support, uploader)
 	}
 
 	if opts.RecoverFile != "" {
@@ -555,7 +643,8 @@ func createRun(opts *CreateOptions) error {
 			return err
 		}
 
-		allowPreview := !state.HasMetadata() && shared.ValidURL(openURL) && !opts.DryRun
+		// Preview opens the browser, which cannot carry an upload.
+		allowPreview := !state.HasMetadata() && shared.ValidURL(openURL) && !opts.DryRun && len(opts.Assets) == 0
 		allowMetadata := ctx.PRRefs.BaseRepo().ViewerCanTriage()
 		action, err = shared.ConfirmPRSubmission(opts.Prompter, allowPreview, allowMetadata, state.Draft)
 		if err != nil {
@@ -569,12 +658,12 @@ func createRun(opts *CreateOptions) error {
 				Repo:      ctx.PRRefs.BaseRepo(),
 				State:     state,
 			}
-			err = shared.MetadataSurvey(opts.Prompter, opts.IO, ctx.PRRefs.BaseRepo(), fetcher, state, projectsV1Support)
+			err = shared.MetadataSurvey(opts.Prompter, opts.IO, ctx.PRRefs.BaseRepo(), fetcher, state, projectsV1Support, reviewerSearchFunc, assigneeSearchFunc)
 			if err != nil {
 				return err
 			}
 
-			action, err = shared.ConfirmPRSubmission(opts.Prompter, !state.HasMetadata() && !opts.DryRun, false, state.Draft)
+			action, err = shared.ConfirmPRSubmission(opts.Prompter, !state.HasMetadata() && !opts.DryRun && len(opts.Assets) == 0, false, state.Draft)
 			if err != nil {
 				return err
 			}
@@ -598,11 +687,11 @@ func createRun(opts *CreateOptions) error {
 
 	if action == shared.SubmitDraftAction {
 		state.Draft = true
-		return submitPR(*opts, *ctx, *state, projectsV1Support)
+		return submitPR(*opts, *ctx, *state, projectsV1Support, uploader)
 	}
 
 	if action == shared.SubmitAction {
-		return submitPR(*opts, *ctx, *state, projectsV1Support)
+		return submitPR(*opts, *ctx, *state, projectsV1Support, uploader)
 	}
 
 	err = errors.New("expected to cancel, preview, or submit")
@@ -623,10 +712,10 @@ func initDefaultTitleBody(ctx CreateContext, state *shared.IssueMetadataState, u
 	} else {
 		state.Title = humanize(ctx.PRRefs.UnqualifiedHeadRef())
 		var body strings.Builder
-		for i := len(commits) - 1; i >= 0; i-- {
-			fmt.Fprintf(&body, "- **%s**\n", commits[i].Title)
+		for i, commit := range slices.Backward(commits) {
+			fmt.Fprintf(&body, "- **%s**\n", commit.Title)
 			if addBody {
-				x := regexPattern.ReplaceAllString(commits[i].Body, "  ")
+				x := regexPattern.ReplaceAllString(commit.Body, "  ")
 				fmt.Fprintf(&body, "%s", x)
 
 				if i > 0 {
@@ -641,21 +730,24 @@ func initDefaultTitleBody(ctx CreateContext, state *shared.IssueMetadataState, u
 	return nil
 }
 
-func NewIssueState(ctx CreateContext, opts CreateOptions) (*shared.IssueMetadataState, error) {
+func NewIssueState(ctx CreateContext, opts CreateOptions, apiActorsSupported bool) (*shared.IssueMetadataState, error) {
 	var milestoneTitles []string
 	if opts.Milestone != "" {
 		milestoneTitles = []string{opts.Milestone}
 	}
 
-	meReplacer := shared.NewMeReplacer(ctx.Client, ctx.PRRefs.BaseRepo().RepoHost())
-	assignees, err := meReplacer.ReplaceSlice(opts.Assignees)
+	assigneeReplacer := shared.NewSpecialAssigneeReplacer(ctx.Client, ctx.PRRefs.BaseRepo().RepoHost(), apiActorsSupported, !opts.WebMode)
+	assignees, err := assigneeReplacer.ReplaceSlice(opts.Assignees)
 	if err != nil {
 		return nil, err
 	}
 
+	copilotReplacer := shared.NewCopilotReviewerReplacer()
+	reviewers := copilotReplacer.ReplaceSlice(opts.Reviewers)
+
 	state := &shared.IssueMetadataState{
 		Type:          shared.PRMetadata,
-		Reviewers:     opts.Reviewers,
+		Reviewers:     reviewers,
 		Assignees:     assignees,
 		Labels:        opts.Labels,
 		ProjectTitles: opts.Projects,
@@ -762,10 +854,8 @@ func NewCreateContext(opts *CreateOptions) (*CreateContext, error) {
 
 		return newCreateContext(skipPushRefs{
 			qualifiedHeadRef: qualifiedHeadRef,
-			baseRefs: baseRefs{
-				baseRepo:       baseRepo,
-				baseBranchName: baseBranch,
-			},
+			baseRepo:         baseRepo,
+			baseBranchName:   baseBranch,
 		}), nil
 	}
 
@@ -999,10 +1089,10 @@ func getRemotes(opts *CreateOptions) (ghContext.Remotes, error) {
 	return remotes, nil
 }
 
-func submitPR(opts CreateOptions, ctx CreateContext, state shared.IssueMetadataState, projectV1Support gh.ProjectsV1Support) error {
+func submitPR(opts CreateOptions, ctx CreateContext, state shared.IssueMetadataState, projectV1Support gh.ProjectsV1Support, uploader *attachments.Uploader) error {
 	client := ctx.Client
 
-	params := map[string]interface{}{
+	params := map[string]any{
 		"title":               state.Title,
 		"body":                state.Body,
 		"draft":               state.Draft,
@@ -1028,6 +1118,21 @@ func submitPR(opts CreateOptions, ctx CreateContext, state shared.IssueMetadataS
 		}
 	}
 
+	var uploadErr error
+	if uploader != nil {
+		body, uploadResult, err := uploader.UploadAndAttach(context.Background(), state.Body, opts.BodyDir, opts.Assets)
+		opts.AttachEvent.RecordOperations(uploadResult)
+		// With nothing uploaded, a body that lost the files it was written
+		// around is not what the caller asked to create. The branch is already
+		// pushed by now, so the message says what was not created rather than
+		// claiming the run had no effect.
+		if err != nil && uploadResult.Uploaded == 0 {
+			return fmt.Errorf("%w\nno pull request was created", err)
+		}
+		uploadErr = err
+		params["body"] = body
+	}
+
 	opts.IO.StartProgressIndicator()
 	pr, err := api.CreatePullRequest(client, ctx.PRRefs.BaseRepo(), params)
 	opts.IO.StopProgressIndicator()
@@ -1036,14 +1141,19 @@ func submitPR(opts CreateOptions, ctx CreateContext, state shared.IssueMetadataS
 	}
 	if err != nil {
 		if pr != nil {
-			return fmt.Errorf("pull request update failed: %w", err)
+			err = fmt.Errorf("pull request update failed: %w", err)
+		} else {
+			err = fmt.Errorf("pull request create failed: %w", err)
 		}
-		return fmt.Errorf("pull request create failed: %w", err)
+		// A failed upload and a failed create have different remedies, and a
+		// failed create leaves the uploaded assets referenced by nothing, so
+		// that error reads first.
+		return errors.Join(uploadErr, err)
 	}
-	return nil
+	return uploadErr
 }
 
-func renderPullRequestPlain(w io.Writer, params map[string]interface{}, state *shared.IssueMetadataState) error {
+func renderPullRequestPlain(w io.Writer, params map[string]any, state *shared.IssueMetadataState) error {
 	fmt.Fprint(w, "Would have created a Pull Request with:\n")
 	fmt.Fprintf(w, "title:\t%s\n", params["title"])
 	fmt.Fprintf(w, "draft:\t%t\n", params["draft"])
@@ -1072,7 +1182,7 @@ func renderPullRequestPlain(w io.Writer, params map[string]interface{}, state *s
 	return nil
 }
 
-func renderPullRequestTTY(io *iostreams.IOStreams, params map[string]interface{}, state *shared.IssueMetadataState) error {
+func renderPullRequestTTY(io *iostreams.IOStreams, params map[string]any, state *shared.IssueMetadataState) error {
 	cs := io.ColorScheme()
 	out := io.Out
 
@@ -1138,10 +1248,8 @@ func handlePush(opts CreateOptions, ctx CreateContext) error {
 		refs = pushableRefs{
 			headRepo:       forkedRepo,
 			headBranchName: forkableRefs.qualifiedHeadRef.BranchName(),
-			baseRefs: baseRefs{
-				baseRepo:       forkableRefs.baseRepo,
-				baseBranchName: forkableRefs.baseBranchName,
-			},
+			baseRepo:       forkableRefs.baseRepo,
+			baseBranchName: forkableRefs.baseBranchName,
 		}
 	}
 

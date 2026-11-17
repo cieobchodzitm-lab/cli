@@ -4,45 +4,53 @@ import (
 	"context"
 	"fmt"
 	"net/http"
-	"os"
 	"regexp"
-	"slices"
+	"sync"
 	"time"
 
 	"github.com/cli/cli/v2/api"
 	ghContext "github.com/cli/cli/v2/context"
 	"github.com/cli/cli/v2/git"
+	"github.com/cli/cli/v2/internal/authflow"
 	"github.com/cli/cli/v2/internal/browser"
-	"github.com/cli/cli/v2/internal/config"
+	"github.com/cli/cli/v2/internal/debug"
 	"github.com/cli/cli/v2/internal/gh"
+	"github.com/cli/cli/v2/internal/gh/ghtelemetry"
 	"github.com/cli/cli/v2/internal/ghrepo"
 	"github.com/cli/cli/v2/internal/prompter"
 	"github.com/cli/cli/v2/pkg/cmd/extension"
 	"github.com/cli/cli/v2/pkg/cmdutil"
 	"github.com/cli/cli/v2/pkg/iostreams"
-	xcolor "github.com/cli/go-gh/v2/pkg/x/color"
 )
 
 var ssoHeader string
 var ssoURLRE = regexp.MustCompile(`\burl=([^;]+)`)
 
-func New(appVersion string) *cmdutil.Factory {
+func New(appVersion string, invokingAgent string, cfgFunc func() (gh.Config, error), ios *iostreams.IOStreams, executablePath string, telemetryDisabler ghtelemetry.Disabler) *cmdutil.Factory {
+	// Inject the OAuth token refresher into the AuthConfig so refreshable credentials can be renewed during ordinary
+	// commands. It is wrapped around cfgFunc before anything else so every consumer resolves the same refresher-aware
+	// configuration.
+	cfgFunc = configWithTokenRefresher(cfgFunc, tokenRefresherHttpClientFunc(ios, appVersion, invokingAgent, telemetryDisabler))
+
 	f := &cmdutil.Factory{
 		AppVersion:     appVersion,
-		Config:         configFunc(), // No factory dependencies
-		ExecutableName: "gh",
+		InvokingAgent:  invokingAgent,
+		Config:         cfgFunc,
+		ExecutablePath: executablePath,
 	}
 
-	f.IOStreams = ioStreams(f)                             // Depends on Config
-	f.HttpClient = httpClientFunc(f, appVersion)           // Depends on Config, IOStreams, and appVersion
-	f.PlainHttpClient = plainHttpClientFunc(f, appVersion) // Depends on IOStreams, and appVersion
-	f.GitClient = newGitClient(f)                          // Depends on IOStreams, and Executable
-	f.Remotes = remotesFunc(f)                             // Depends on Config, and GitClient
-	f.BaseRepo = BaseRepoFunc(f)                           // Depends on Remotes
-	f.Prompter = newPrompter(f)                            // Depends on Config and IOStreams
-	f.Browser = newBrowser(f)                              // Depends on Config, and IOStreams
-	f.ExtensionManager = extensionManager(f)               // Depends on Config, HttpClient, and IOStreams
-	f.Branch = branchFunc(f)                               // Depends on GitClient
+	f.IOStreams = ios
+	f.TelemetryDisabler = telemetryDisabler
+	f.HttpClient = HttpClientFunc(cfgFunc, ios, appVersion, invokingAgent, telemetryDisabler)
+	f.PlainHttpClient = plainHttpClientFunc(ios, appVersion, invokingAgent, telemetryDisabler)
+	f.ExternalHttpClient = externalHttpClientFunc(ios, appVersion)
+	f.GitClient = newGitClient(f) // Depends on IOStreams, and Executable
+	f.Remotes = remotesFunc(f)    // Depends on Config, and GitClient
+	f.BaseRepo = BaseRepoFunc(f.Remotes)
+	f.Prompter = newPrompter(f)              // Depends on Config and IOStreams
+	f.Browser = newBrowser(f)                // Depends on Config, and IOStreams
+	f.ExtensionManager = extensionManager(f) // Depends on Config, HttpClient, and IOStreams
+	f.Branch = branchFunc(f)                 // Depends on GitClient
 
 	return f
 }
@@ -72,9 +80,9 @@ func New(appVersion string) *cmdutil.Factory {
 // origin  https://github.com/cli/cli-fork.git (push)
 //
 // With this resolution function, the upstream will always be chosen (assuming we have authenticated with github.com).
-func BaseRepoFunc(f *cmdutil.Factory) func() (ghrepo.Interface, error) {
+func BaseRepoFunc(remotesFunc func() (ghContext.Remotes, error)) func() (ghrepo.Interface, error) {
 	return func() (ghrepo.Interface, error) {
-		remotes, err := f.Remotes()
+		remotes, err := remotesFunc()
 		if err != nil {
 			return nil, err
 		}
@@ -186,18 +194,19 @@ func remotesFunc(f *cmdutil.Factory) func() (ghContext.Remotes, error) {
 	return rr.Resolver()
 }
 
-func httpClientFunc(f *cmdutil.Factory, appVersion string) func() (*http.Client, error) {
+func HttpClientFunc(cfgFunc func() (gh.Config, error), ios *iostreams.IOStreams, appVersion string, invokingAgent string, telemetryDisabler ghtelemetry.Disabler) func() (*http.Client, error) {
 	return func() (*http.Client, error) {
-		io := f.IOStreams
-		cfg, err := f.Config()
+		cfg, err := cfgFunc()
 		if err != nil {
 			return nil, err
 		}
 		opts := api.HTTPClientOptions{
-			Config:      cfg.Authentication(),
-			Log:         io.ErrOut,
-			LogColorize: io.ColorEnabled(),
-			AppVersion:  appVersion,
+			RefreshingConfig:  cfg.Authentication(),
+			Log:               ios.ErrOut,
+			LogColorize:       ios.ColorEnabled(),
+			AppVersion:        appVersion,
+			InvokingAgent:     invokingAgent,
+			TelemetryDisabler: telemetryDisabler,
 		}
 		client, err := api.NewHTTPClient(opts)
 		if err != nil {
@@ -208,15 +217,41 @@ func httpClientFunc(f *cmdutil.Factory, appVersion string) func() (*http.Client,
 	}
 }
 
-func plainHttpClientFunc(f *cmdutil.Factory, appVersion string) func() (*http.Client, error) {
+// tokenRefresherHttpClientFunc builds the HTTP client used to renew OAuth tokens. It mirrors plainHttpClientFunc but
+// defaults to headline-only logging so that, under GH_DEBUG=api, the refresh exchange does not produce a
+// full request/response trace. A token refresh is a side-band exchange triggered from within an ordinary request's
+// round trip, so a verbose trace would interleave the refresh traffic in the middle of the request trace the user is
+// actually inspecting. Auth flows that should surface their own full traffic use f.PlainHttpClient instead.
+func tokenRefresherHttpClientFunc(ios *iostreams.IOStreams, appVersion string, invokingAgent string, telemetryDisabler ghtelemetry.Disabler) func() (*http.Client, error) {
 	return func() (*http.Client, error) {
-		io := f.IOStreams
+		logHeadlineOnly := true
+		if verbose, ok := debug.Config().VerboseTokenRefresh.Value(); ok {
+			logHeadlineOnly = !verbose
+		}
 		opts := api.HTTPClientOptions{
-			Log:         io.ErrOut,
-			LogColorize: io.ColorEnabled(),
-			AppVersion:  appVersion,
+			Log:             ios.ErrOut,
+			LogColorize:     ios.ColorEnabled(),
+			LogHeadlineOnly: logHeadlineOnly,
+			AppVersion:      appVersion,
+			InvokingAgent:   invokingAgent,
 			// This is required to prevent automatic setting of auth and other headers.
 			SkipDefaultHeaders: true,
+			TelemetryDisabler:  telemetryDisabler,
+		}
+		return api.NewHTTPClient(opts)
+	}
+}
+
+func plainHttpClientFunc(ios *iostreams.IOStreams, appVersion string, invokingAgent string, telemetryDisabler ghtelemetry.Disabler) func() (*http.Client, error) {
+	return func() (*http.Client, error) {
+		opts := api.HTTPClientOptions{
+			Log:           ios.ErrOut,
+			LogColorize:   ios.ColorEnabled(),
+			AppVersion:    appVersion,
+			InvokingAgent: invokingAgent,
+			// This is required to prevent automatic setting of auth and other headers.
+			SkipDefaultHeaders: true,
+			TelemetryDisabler:  telemetryDisabler,
 		}
 		client, err := api.NewHTTPClient(opts)
 		if err != nil {
@@ -226,11 +261,43 @@ func plainHttpClientFunc(f *cmdutil.Factory, appVersion string) func() (*http.Cl
 	}
 }
 
+// configWithTokenRefresher returns a config accessor that injects the OAuth token refresher into the AuthConfig the
+// first time the configuration is resolved, so refreshable credentials can be renewed during ordinary commands. The
+// refresher uses a plain HTTP client that sets no auth headers, since the token endpoint is reached without an
+// existing token. Injection runs once because Authentication returns a single shared AuthConfig; if the plain client
+// cannot be built, injection is skipped and token refresh simply stays inapplicable rather than failing the command.
+func configWithTokenRefresher(cfgFunc func() (gh.Config, error), plainClientFunc func() (*http.Client, error)) func() (gh.Config, error) {
+	var once sync.Once
+	return func() (gh.Config, error) {
+		cfg, err := cfgFunc()
+		if err != nil {
+			return nil, err
+		}
+		once.Do(func() {
+			plainClient, err := plainClientFunc()
+			if err != nil {
+				return
+			}
+			cfg.Authentication().SetTokenRefresher(authflow.NewTokenRefresher(plainClient))
+		})
+		return cfg, nil
+	}
+}
+
+func externalHttpClientFunc(ios *iostreams.IOStreams, appVersion string) func() (*http.Client, error) {
+	return func() (*http.Client, error) {
+		return api.NewExternalHTTPClient(api.ExternalHTTPClientOptions{
+			AppVersion:  appVersion,
+			Log:         ios.ErrOut,
+			LogColorize: ios.ColorEnabled(),
+		})
+	}
+}
+
 func newGitClient(f *cmdutil.Factory) *git.Client {
 	io := f.IOStreams
-	ghPath := f.Executable()
 	client := &git.Client{
-		GhPath: ghPath,
+		GhPath: f.ExecutablePath,
 		Stderr: io.ErrOut,
 		Stdin:  io.In,
 		Stdout: io.Out,
@@ -249,18 +316,6 @@ func newPrompter(f *cmdutil.Factory) prompter.Prompter {
 	return prompter.New(editor, io)
 }
 
-func configFunc() func() (gh.Config, error) {
-	var cachedConfig gh.Config
-	var configError error
-	return func() (gh.Config, error) {
-		if cachedConfig != nil || configError != nil {
-			return cachedConfig, configError
-		}
-		cachedConfig, configError = config.NewConfig()
-		return cachedConfig, configError
-	}
-}
-
 func branchFunc(f *cmdutil.Factory) func() (string, error) {
 	return func() (string, error) {
 		currentBranch, err := f.GitClient.CurrentBranch(context.Background())
@@ -272,7 +327,7 @@ func branchFunc(f *cmdutil.Factory) func() (string, error) {
 }
 
 func extensionManager(f *cmdutil.Factory) *extension.Manager {
-	em := extension.NewManager(f.IOStreams, f.GitClient)
+	em := extension.NewManager(f.IOStreams, f.GitClient, f.ExecutablePath)
 
 	cfg, err := f.Config()
 	if err != nil {
@@ -288,65 +343,6 @@ func extensionManager(f *cmdutil.Factory) *extension.Manager {
 	em.SetClient(api.NewCachedHTTPClient(client, time.Second*30))
 
 	return em
-}
-
-func ioStreams(f *cmdutil.Factory) *iostreams.IOStreams {
-	io := iostreams.System()
-	cfg, err := f.Config()
-	if err != nil {
-		return io
-	}
-
-	if _, ghPromptDisabled := os.LookupEnv("GH_PROMPT_DISABLED"); ghPromptDisabled {
-		io.SetNeverPrompt(true)
-	} else if prompt := cfg.Prompt(""); prompt.Value == "disabled" {
-		io.SetNeverPrompt(true)
-	}
-
-	falseyValues := []string{"false", "0", "no", ""}
-
-	accessiblePrompterValue, accessiblePrompterIsSet := os.LookupEnv("GH_ACCESSIBLE_PROMPTER")
-	if accessiblePrompterIsSet {
-		if !slices.Contains(falseyValues, accessiblePrompterValue) {
-			io.SetAccessiblePrompterEnabled(true)
-		}
-	} else if prompt := cfg.AccessiblePrompter(""); prompt.Value == "enabled" {
-		io.SetAccessiblePrompterEnabled(true)
-	}
-
-	ghSpinnerDisabledValue, ghSpinnerDisabledIsSet := os.LookupEnv("GH_SPINNER_DISABLED")
-	if ghSpinnerDisabledIsSet {
-		if !slices.Contains(falseyValues, ghSpinnerDisabledValue) {
-			io.SetSpinnerDisabled(true)
-		}
-	} else if spinnerDisabled := cfg.Spinner(""); spinnerDisabled.Value == "disabled" {
-		io.SetSpinnerDisabled(true)
-	}
-
-	// Pager precedence
-	// 1. GH_PAGER
-	// 2. pager from config
-	// 3. PAGER
-	if ghPager, ghPagerExists := os.LookupEnv("GH_PAGER"); ghPagerExists {
-		io.SetPager(ghPager)
-	} else if pager := cfg.Pager(""); pager.Value != "" {
-		io.SetPager(pager.Value)
-	}
-
-	if ghColorLabels, ghColorLabelsExists := os.LookupEnv("GH_COLOR_LABELS"); ghColorLabelsExists {
-		switch ghColorLabels {
-		case "", "0", "false", "no":
-			io.SetColorLabels(false)
-		default:
-			io.SetColorLabels(true)
-		}
-	} else if prompt := cfg.ColorLabels(""); prompt.Value == "enabled" {
-		io.SetColorLabels(true)
-	}
-
-	io.SetAccessibleColorsEnabled(xcolor.IsAccessibleColorsEnabled())
-
-	return io
 }
 
 // SSOURL returns the URL of a SAML SSO challenge received by the server for clients that use ExtractHeader

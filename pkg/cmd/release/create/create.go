@@ -13,6 +13,7 @@ import (
 	"github.com/cli/cli/v2/git"
 	"github.com/cli/cli/v2/internal/gh"
 	"github.com/cli/cli/v2/internal/ghrepo"
+	"github.com/cli/cli/v2/internal/safeurl"
 	"github.com/cli/cli/v2/internal/text"
 	"github.com/cli/cli/v2/pkg/cmd/release/shared"
 	"github.com/cli/cli/v2/pkg/cmdutil"
@@ -113,12 +114,15 @@ func NewCmdCreate(f *cmdutil.Factory, runF func(*CreateOptions) error) *cobra.Co
 			- Git tags associated with a release cannot be modified or deleted.
 			- Release assets cannot be modified or deleted.
 
-			Immutability is enforced only after a release is published. Draft releases can be modified
-			or deleted, and the associated git tags can be modified or deleted as well.
+			When you attach assets, %[1]sgh release create%[1]s creates a draft release, uploads
+			each asset, and then publishes the release. These steps use separate API requests
+			and do not form a single atomic operation. If you specify %[1]s--draft%[1]s, the command
+			leaves the release unpublished.
 
-			When using the %[1]screate%[1]s command to attach assets to a release, separate API calls
-			are made to create the release as a draft, upload the assets, and then publish the release.
-			Immutability protections will be enforced ONLY after the release is published.
+			When release immutability is enabled for the repository, its protections take effect
+			only when the release is published. While the release remains a draft, users and
+			workflows with the required permissions can modify it and its assets, including while
+			this command is running.
 		`, "`"),
 		Example: heredoc.Doc(`
 			# Interactively create a release
@@ -444,7 +448,7 @@ func createRun(opts *CreateOptions) error {
 		}
 	}
 
-	params := map[string]interface{}{
+	params := map[string]any{
 		"tag_name":   opts.TagName,
 		"draft":      opts.Draft,
 		"prerelease": opts.Prerelease,
@@ -512,8 +516,7 @@ func createRun(opts *CreateOptions) error {
 
 	newRelease, err := createRelease(httpClient, baseRepo, params)
 
-	var errMissingRequiredWorkflowScope *errMissingRequiredWorkflowScope
-	if errors.As(err, &errMissingRequiredWorkflowScope) {
+	if errMissingRequiredWorkflowScope, ok := errors.AsType[*errMissingRequiredWorkflowScope](err); ok {
 		host := errMissingRequiredWorkflowScope.Hostname
 		refreshInstructions := fmt.Sprintf("gh auth refresh -h %[1]s -s workflow", host)
 		cs := opts.IO.ColorScheme()
@@ -534,7 +537,7 @@ func createRun(opts *CreateOptions) error {
 		if !draftWhileUploading {
 			return err
 		}
-		if cleanupErr := deleteRelease(httpClient, newRelease); cleanupErr != nil {
+		if cleanupErr := deleteRelease(httpClient, baseRepo.RepoHost(), safeurl.NewImmutableSafeURL(newRelease.APIURL)); cleanupErr != nil {
 			return fmt.Errorf("%w\ncleaning up draft failed: %v", err, cleanupErr)
 		}
 		return err
@@ -547,14 +550,14 @@ func createRun(opts *CreateOptions) error {
 		}
 
 		opts.IO.StartProgressIndicator()
-		err = shared.ConcurrentUpload(httpClient, uploadURL, opts.Concurrency, opts.Assets)
+		err = shared.ConcurrentUpload(httpClient, baseRepo.RepoHost(), safeurl.NewImmutableSafeURL(uploadURL), opts.Concurrency, opts.Assets)
 		opts.IO.StopProgressIndicator()
 		if err != nil {
 			return cleanupDraftRelease(err)
 		}
 
 		if draftWhileUploading {
-			rel, err := publishRelease(httpClient, newRelease.APIURL, opts.DiscussionCategory, opts.IsLatest)
+			rel, err := publishRelease(httpClient, baseRepo.RepoHost(), safeurl.NewImmutableSafeURL(newRelease.APIURL), opts.DiscussionCategory, opts.IsLatest)
 			if err != nil {
 				return cleanupDraftRelease(err)
 			}
@@ -627,7 +630,7 @@ func changelogForRange(client *git.Client, refRange string) ([]logEntry, error) 
 	}
 
 	var entries []logEntry
-	for _, cb := range bytes.Split(b, []byte{'\000'}) {
+	for cb := range bytes.SplitSeq(b, []byte{'\000'}) {
 		c := strings.ReplaceAll(string(cb), "\r\n", "\n")
 		c = strings.TrimPrefix(c, "\n")
 		if len(c) == 0 {

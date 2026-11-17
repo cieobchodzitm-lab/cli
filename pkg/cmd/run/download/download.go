@@ -4,9 +4,11 @@ import (
 	"errors"
 	"fmt"
 	"path/filepath"
+	"slices"
 
 	"github.com/MakeNowJust/heredoc"
 	"github.com/cli/cli/v2/internal/safepaths"
+	"github.com/cli/cli/v2/internal/safeurl"
 	"github.com/cli/cli/v2/pkg/cmd/run/shared"
 	"github.com/cli/cli/v2/pkg/cmdutil"
 	"github.com/cli/cli/v2/pkg/iostreams"
@@ -28,7 +30,7 @@ type DownloadOptions struct {
 
 type platform interface {
 	List(runID string) ([]shared.Artifact, error)
-	Download(url string, dir safepaths.Absolute) error
+	Download(url safeurl.SafeURL, openDestination func() (*safepaths.Root, error)) error
 }
 
 type iprompter interface {
@@ -150,23 +152,11 @@ func runDownload(opts *DownloadOptions) error {
 		}
 	}
 
-	opts.IO.StartProgressIndicator()
-	defer opts.IO.StopProgressIndicator()
-
-	// track downloaded artifacts and avoid re-downloading any of the same name, isolate if multiple artifacts
-	downloaded := set.NewStringSet()
-	isolateArtifacts := isolateArtifacts(wantNames, wantPatterns)
-
-	absoluteDestinationDir, err := safepaths.ParseAbsolute(opts.DestinationDir)
-	if err != nil {
-		return fmt.Errorf("error parsing destination directory: %w", err)
-	}
-
+	// Select matching artifacts before creating the destination directory.
+	selectedNames := set.NewStringSet()
+	var selected []shared.Artifact
 	for _, a := range artifacts {
-		if a.Expired {
-			continue
-		}
-		if downloaded.Contains(a.Name) {
+		if a.Expired || selectedNames.Contains(a.Name) {
 			continue
 		}
 		if len(wantNames) > 0 || len(wantPatterns) > 0 {
@@ -174,28 +164,49 @@ func runDownload(opts *DownloadOptions) error {
 				continue
 			}
 		}
+		selected = append(selected, a)
+		selectedNames.Add(a.Name)
+	}
+	if len(selected) == 0 {
+		return errors.New("no artifact matches any of the names or patterns provided")
+	}
 
-		destDir := absoluteDestinationDir
+	opts.IO.StartProgressIndicator()
+	defer opts.IO.StopProgressIndicator()
+
+	isolateArtifacts := isolateArtifacts(wantNames, wantPatterns)
+
+	for _, a := range selected {
 		if isolateArtifacts {
-			destDir, err = absoluteDestinationDir.Join(a.Name)
-			if err != nil {
-				var pathTraversalError safepaths.PathTraversalError
-				if errors.As(err, &pathTraversalError) {
-					return fmt.Errorf("error downloading %s: would result in path traversal", a.Name)
-				}
-				return err
+			if err := safepaths.ValidateChild(a.Name); err != nil {
+				return fmt.Errorf("error downloading %s: would result in path traversal", a.Name)
 			}
 		}
 
-		err := opts.Platform.Download(a.DownloadURL, destDir)
+		openDestination := func() (*safepaths.Root, error) {
+			root, err := safepaths.OpenRootDir(opts.DestinationDir, 0o755)
+			if err != nil {
+				return nil, fmt.Errorf("error opening destination directory: %w", err)
+			}
+			if !isolateArtifacts {
+				return root, nil
+			}
+			destDir, err := root.Sub(a.Name, 0o755)
+			closeErr := root.Close()
+			if err != nil {
+				return nil, err
+			}
+			if closeErr != nil {
+				_ = destDir.Close()
+				return nil, closeErr
+			}
+			return destDir, nil
+		}
+
+		err := opts.Platform.Download(safeurl.NewImmutableSafeURL(a.DownloadURL), openDestination)
 		if err != nil {
 			return fmt.Errorf("error downloading %s: %w", a.Name, err)
 		}
-		downloaded.Add(a.Name)
-	}
-
-	if downloaded.Len() == 0 {
-		return errors.New("no artifact matches any of the names or patterns provided")
 	}
 
 	return nil
@@ -221,12 +232,7 @@ func isolateArtifacts(wantNames []string, wantPatterns []string) bool {
 }
 
 func matchAnyName(names []string, name string) bool {
-	for _, n := range names {
-		if name == n {
-			return true
-		}
-	}
-	return false
+	return slices.Contains(names, name)
 }
 
 func matchAnyPattern(patterns []string, name string) bool {

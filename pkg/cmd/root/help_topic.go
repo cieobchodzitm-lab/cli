@@ -43,11 +43,12 @@ var HelpTopics = []helpTopic{
 		short: "Environment variables that can be used with gh",
 		long: heredoc.Docf(`
 			%[1]sGH_TOKEN%[1]s, %[1]sGITHUB_TOKEN%[1]s (in order of precedence): an authentication token that will be used when
-			a command targets either %[1]sgithub.com%[1]s or a subdomain of %[1]sghe.com%[1]s. Setting this avoids being prompted to
-			authenticate and takes precedence over previously stored credentials.
+			a command targets %[1]sgithub.com%[1]s, a subdomain of %[1]sghe.com%[1]s, or %[1]sgithub.localhost%[1]s. Setting this avoids
+			being prompted to authenticate and takes precedence over previously stored credentials.
 
 			%[1]sGH_ENTERPRISE_TOKEN%[1]s, %[1]sGITHUB_ENTERPRISE_TOKEN%[1]s (in order of precedence): an authentication
-			token that will be used when a command targets a GitHub Enterprise Server host.
+			token that will be used when a command targets a GitHub Enterprise Server host. %[1]sgh%[1]s treats any host other
+			than %[1]sgithub.com%[1]s, a subdomain of %[1]sghe.com%[1]s, or %[1]sgithub.localhost%[1]s as a GitHub Enterprise Server host.
 
 			%[1]sGH_HOST%[1]s: specify the GitHub hostname for commands where a hostname has not been provided, or
 			cannot be inferred from the context of a local Git repository. If this host was previously
@@ -99,6 +100,9 @@ var HelpTopics = []helpTopic{
 			When an extension is executed, gh checks for new versions for the executed extension once every 24 hours.
 			If a newer version was found, an upgrade notice is displayed on standard error.
 
+			%[1]sGH_EXTENSION%[1]s: set to %[1]s1%[1]s by gh when it invokes an extension, allowing an extension to
+			tell whether it was run as %[1]sgh <extension>%[1]s or directly as a standalone program.
+
 			%[1]sGH_CONFIG_DIR%[1]s: the directory where gh will store configuration files. If not specified,
 			the default value will be one of the following paths (in order of precedence):
 			  - %[1]s$XDG_CONFIG_HOME/gh%[1]s (if %[1]s$XDG_CONFIG_HOME%[1]s is set),
@@ -108,7 +112,8 @@ var HelpTopics = []helpTopic{
 			%[1]sGH_PROMPT_DISABLED%[1]s: set to any value to disable interactive prompting in the terminal.
 
 			%[1]sGH_PATH%[1]s: set the path to the gh executable, useful for when gh can not properly determine
-			its own path such as in the cygwin terminal.
+			its own path such as in the cygwin terminal. gh also sets this when invoking extensions so they
+			can call back into the same gh executable.
 
 			%[1]sGH_MDWIDTH%[1]s: default maximum width for markdown render wrapping.  The max width of lines
 			wrapped on the terminal will be taken as the lesser of the terminal width, this value, or 120 if
@@ -117,9 +122,25 @@ var HelpTopics = []helpTopic{
 			%[1]sGH_ACCESSIBLE_PROMPTER%[1]s (preview): set to a truthy value to enable prompts that are
 			more compatible with speech synthesis and braille screen readers.
 
+			%[1]sGH_TELEMETRY%[1]s: set to %[1]slog%[1]s to print telemetry data to standard error instead of sending it.
+			Set to %[1]sfalse%[1]s or %[1]s0%[1]s to disable telemetry. Takes precedence over %[1]sDO_NOT_TRACK%[1]s.
+
+			%[1]sDO_NOT_TRACK%[1]s: set to %[1]strue%[1]s or %[1]s1%[1]s to disable telemetry. Ignored when
+			%[1]sGH_TELEMETRY%[1]s is set, which takes precedence.
+
 			%[1]sGH_SPINNER_DISABLED%[1]s: set to a truthy value to replace the spinner animation with
 			a textual progress indicator.
 		`, "`"),
+	},
+	{
+		name:  "telemetry",
+		short: "Information about telemetry in gh",
+		long: heredoc.Doc(`
+			gh collects telemetry to help us understand how the CLI is being used and to improve it.
+
+			To learn more about what data is collected, how it is used, and how to opt out, see:
+			<https://cli.github.com/telemetry>
+		`),
 	},
 	{
 		name:  "reference",

@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"fmt"
 	"net/http"
+	"os"
+	"path/filepath"
 	"runtime"
 	"strings"
 	"testing"
@@ -15,7 +17,6 @@ import (
 	"github.com/cli/cli/v2/pkg/cmd/attestation/test"
 	"github.com/cli/cli/v2/pkg/cmdutil"
 
-	"github.com/cli/cli/v2/pkg/httpmock"
 	"github.com/cli/cli/v2/pkg/iostreams"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -39,10 +40,10 @@ func TestNewDownloadCmd(t *testing.T) {
 	f := &cmdutil.Factory{
 		IOStreams: testIO,
 		HttpClient: func() (*http.Client, error) {
-			reg := &httpmock.Registry{}
-			client := &http.Client{}
-			httpmock.ReplaceTripper(client, reg)
-			return client, nil
+			return nil, nil
+		},
+		ExternalHttpClient: func() (*http.Client, error) {
+			return nil, nil
 		},
 	}
 
@@ -325,5 +326,27 @@ func TestRunDownload(t *testing.T) {
 		err := runDownload(&opts)
 		require.Error(t, err)
 		require.ErrorAs(t, err, &ErrAttestationFileCreation)
+	})
+
+	t.Run("replaces destination symlink without following it", func(t *testing.T) {
+		opts := baseOpts
+		outputDir := t.TempDir()
+		opts.Store = NewLiveStore(outputDir)
+
+		digested, err := artifact.NewDigestedArtifact(opts.OCIClient, opts.ArtifactPath, opts.DigestAlgorithm)
+		require.NoError(t, err)
+		metadataPath := opts.Store.(*LiveStore).createJSONLinesFilePath(digested.DigestWithAlg())
+		targetPath := filepath.Join(outputDir, "target.jsonl")
+		require.NoError(t, os.WriteFile(targetPath, []byte("unchanged"), 0o644))
+		require.NoError(t, os.Symlink(filepath.Base(targetPath), metadataPath))
+
+		require.NoError(t, runDownload(&opts))
+
+		info, err := os.Lstat(metadataPath)
+		require.NoError(t, err)
+		assert.Zero(t, info.Mode()&os.ModeSymlink)
+		target, err := os.ReadFile(targetPath)
+		require.NoError(t, err)
+		assert.Equal(t, "unchanged", string(target))
 	})
 }

@@ -2,6 +2,7 @@ package edit
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
 	"net/http"
 	"os"
@@ -9,9 +10,12 @@ import (
 	"testing"
 
 	"github.com/cli/cli/v2/api"
+	"github.com/cli/cli/v2/internal/attachments"
 	fd "github.com/cli/cli/v2/internal/featuredetection"
 	"github.com/cli/cli/v2/internal/gh"
+	"github.com/cli/cli/v2/internal/gh/ghtelemetry"
 	"github.com/cli/cli/v2/internal/ghrepo"
+	"github.com/cli/cli/v2/internal/telemetry"
 	shared "github.com/cli/cli/v2/pkg/cmd/pr/shared"
 	"github.com/cli/cli/v2/pkg/cmdutil"
 	"github.com/cli/cli/v2/pkg/httpmock"
@@ -26,13 +30,27 @@ func TestNewCmdEdit(t *testing.T) {
 	err := os.WriteFile(tmpFile, []byte("a body from file"), 0600)
 	require.NoError(t, err)
 
+	tmpImage := filepath.Join(t.TempDir(), "shot.png")
+	require.NoError(t, os.WriteFile(tmpImage, []byte("the bytes"), 0600))
+
+	attachmentEvent := []ghtelemetry.Event{{
+		Type:       "attachment_invocation",
+		Dimensions: ghtelemetry.Dimensions{"command": "edit"},
+		Measures: ghtelemetry.Measures{
+			"attach_count": 1, "append_ops_count": 0, "replace_ops_count": 0,
+		},
+	}}
+
 	tests := []struct {
 		name             string
 		input            string
 		stdin            string
 		output           EditOptions
+		wantAssetPaths   []string
 		expectedBaseRepo ghrepo.Interface
 		wantsErr         bool
+		wantEvents       []ghtelemetry.Event
+		wantSampleRate   int
 	}{
 		{
 			name:  "no argument",
@@ -122,6 +140,7 @@ func TestNewCmdEdit(t *testing.T) {
 						Edited: true,
 					},
 				},
+				BodyDir: filepath.Dir(tmpFile),
 			},
 			wantsErr: false,
 		},
@@ -297,9 +316,55 @@ func TestNewCmdEdit(t *testing.T) {
 			input:    "23 --milestone foo --remove-milestone",
 			wantsErr: true,
 		},
+		{
+			name:  "attach alone runs without prompting",
+			input: fmt.Sprintf("23 --attach '%s'", tmpImage),
+			output: EditOptions{
+				SelectorArg: "23",
+				Interactive: false,
+			},
+			wantAssetPaths: []string{tmpImage},
+			wantEvents:     attachmentEvent,
+			wantSampleRate: ghtelemetry.SAMPLE_ALL,
+		},
+		{
+			name:     "argument validation skips attachment telemetry",
+			input:    fmt.Sprintf("23 24 --attach '%s'", tmpImage),
+			wantsErr: true,
+		},
+		{
+			name:  "attach with body records the body that replaces the old one",
+			input: fmt.Sprintf("23 --body 'a new body' --attach '%s'", tmpImage),
+			output: EditOptions{
+				SelectorArg: "23",
+				Interactive: false,
+				Editable: shared.Editable{
+					Body: shared.EditableString{
+						Value:  "a new body",
+						Edited: true,
+					},
+				},
+			},
+			wantAssetPaths: []string{tmpImage},
+			wantEvents:     attachmentEvent,
+			wantSampleRate: ghtelemetry.SAMPLE_ALL,
+		},
+		{
+			name:           "attach rejects a missing file",
+			input:          "23 --attach ./nope.png",
+			wantsErr:       true,
+			wantEvents:     attachmentEvent,
+			wantSampleRate: ghtelemetry.SAMPLE_ALL,
+		},
+		{
+			name:     "body flag conflict skips attachment telemetry",
+			input:    fmt.Sprintf("23 --body test --body-file '%s' --attach '%s'", tmpFile, tmpImage),
+			wantsErr: true,
+		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
+			// Given command inputs and an invocation recorder
 			ios, stdin, _, _ := iostreams.Test()
 			ios.SetStdoutTTY(true)
 			ios.SetStdinTTY(true)
@@ -314,10 +379,11 @@ func TestNewCmdEdit(t *testing.T) {
 			}
 
 			argv, err := shlex.Split(tt.input)
-			assert.NoError(t, err)
+			require.NoError(t, err)
 
 			var gotOpts *EditOptions
-			cmd := NewCmdEdit(f, func(opts *EditOptions) error {
+			recorder := &telemetry.InvocationRecorderSpy{}
+			cmd := NewCmdEdit(f, recorder, func(opts *EditOptions) error {
 				gotOpts = opts
 				return nil
 			})
@@ -328,16 +394,28 @@ func TestNewCmdEdit(t *testing.T) {
 			cmd.SetOut(&bytes.Buffer{})
 			cmd.SetErr(&bytes.Buffer{})
 
+			// When the command executes
 			_, err = cmd.ExecuteC()
+			// Then telemetry starts only if execution reaches attachment validation
+			assert.Equal(t, tt.wantEvents, recorder.Events())
+			assert.Equal(t, tt.wantSampleRate, recorder.LastSampleRate)
 			if tt.wantsErr {
-				assert.Error(t, err)
+				require.Error(t, err)
 				return
 			}
 
-			assert.NoError(t, err)
+			require.NoError(t, err)
 			assert.Equal(t, tt.output.SelectorArg, gotOpts.SelectorArg)
 			assert.Equal(t, tt.output.Interactive, gotOpts.Interactive)
 			assert.Equal(t, tt.output.Editable, gotOpts.Editable)
+			assert.Equal(t, tt.output.BodyDir, gotOpts.BodyDir)
+
+			var assetPaths []string
+			for _, a := range gotOpts.Assets {
+				assetPaths = append(assetPaths, a.Path())
+			}
+			assert.Equal(t, tt.wantAssetPaths, assetPaths)
+
 			if tt.expectedBaseRepo != nil {
 				baseRepo, err := gotOpts.BaseRepo()
 				require.NoError(t, err)
@@ -356,8 +434,16 @@ func Test_editRun(t *testing.T) {
 		name      string
 		input     *EditOptions
 		httpStubs func(*testing.T, *httpmock.Registry)
-		stdout    string
-		stderr    string
+		attach    []string
+		uploads   []attachments.UploadStub
+		// Empty means the row does not care which host was reached.
+		wantUploadHost     string
+		wantLookupFields   []string
+		wantNoLookupFields []string
+		stdout             string
+		stderr             string
+		wantErr            string
+		wantOperations     *attachments.UploadResult
 	}{
 		{
 			name: "non-interactive",
@@ -368,56 +454,54 @@ func Test_editRun(t *testing.T) {
 					URL: "https://github.com/OWNER/REPO/pull/123",
 				}, ghrepo.New("OWNER", "REPO")),
 				Interactive: false,
-				Editable: shared.Editable{
-					Title: shared.EditableString{
-						Value:  "new title",
+				Title: shared.EditableString{
+					Value:  "new title",
+					Edited: true,
+				},
+				Body: shared.EditableString{
+					Value:  "new body",
+					Edited: true,
+				},
+				Base: shared.EditableString{
+					Value:  "base-branch-name",
+					Edited: true,
+				},
+				Reviewers: shared.EditableReviewers{EditableSlice: shared.EditableSlice{
+					Add:    []string{"OWNER/core", "OWNER/external", "monalisa", "hubot"},
+					Remove: []string{"dependabot"},
+					Edited: true,
+				}},
+				Assignees: shared.EditableAssignees{
+					EditableSlice: shared.EditableSlice{
+						Add:    []string{"monalisa", "hubot"},
+						Remove: []string{"octocat"},
 						Edited: true,
 					},
-					Body: shared.EditableString{
-						Value:  "new body",
+				},
+				Labels: shared.EditableSlice{
+					Add:    []string{"feature", "TODO", "bug"},
+					Remove: []string{"docs"},
+					Edited: true,
+				},
+				Projects: shared.EditableProjects{
+					EditableSlice: shared.EditableSlice{
+						Add:    []string{"Cleanup", "CleanupV2"},
+						Remove: []string{"Roadmap", "RoadmapV2"},
 						Edited: true,
 					},
-					Base: shared.EditableString{
-						Value:  "base-branch-name",
-						Edited: true,
-					},
-					Reviewers: shared.EditableReviewers{EditableSlice: shared.EditableSlice{
-						Add:    []string{"OWNER/core", "OWNER/external", "monalisa", "hubot"},
-						Remove: []string{"dependabot"},
-						Edited: true,
-					}},
-					Assignees: shared.EditableAssignees{
-						EditableSlice: shared.EditableSlice{
-							Add:    []string{"monalisa", "hubot"},
-							Remove: []string{"octocat"},
-							Edited: true,
-						},
-					},
-					Labels: shared.EditableSlice{
-						Add:    []string{"feature", "TODO", "bug"},
-						Remove: []string{"docs"},
-						Edited: true,
-					},
-					Projects: shared.EditableProjects{
-						EditableSlice: shared.EditableSlice{
-							Add:    []string{"Cleanup", "CleanupV2"},
-							Remove: []string{"Roadmap", "RoadmapV2"},
-							Edited: true,
-						},
-					},
-					Milestone: shared.EditableString{
-						Value:  "GA",
-						Edited: true,
-					},
+				},
+				Milestone: shared.EditableString{
+					Value:  "GA",
+					Edited: true,
 				},
 				Fetcher: testFetcher{},
 			},
 			httpStubs: func(t *testing.T, reg *httpmock.Registry) {
 				// Non-interactive with Add/Remove doesn't need reviewers/assignees metadata
 				// REST API accepts logins and team slugs directly
-				mockRepoMetadata(reg, mockRepoMetadataOptions{reviewers: false, teamReviewers: false, assignees: true, labels: true, projects: true, milestones: true})
+				mockRepoMetadata(reg, mockRepoMetadataOptions{reviewers: false, teamReviewers: false, assignees: false, labels: true, projects: true, milestones: true})
 				mockPullRequestUpdate(reg)
-				mockPullRequestUpdateActorAssignees(reg)
+				mockPullRequestUpdateApiActors(reg)
 				mockRequestReviewsByLogin(reg)
 				mockPullRequestUpdateLabels(reg)
 				mockProjectV2ItemUpdate(reg)
@@ -433,49 +517,47 @@ func Test_editRun(t *testing.T) {
 					URL: "https://github.com/OWNER/REPO/pull/123",
 				}, ghrepo.New("OWNER", "REPO")),
 				Interactive: false,
-				Editable: shared.Editable{
-					Title: shared.EditableString{
-						Value:  "new title",
+				Title: shared.EditableString{
+					Value:  "new title",
+					Edited: true,
+				},
+				Body: shared.EditableString{
+					Value:  "new body",
+					Edited: true,
+				},
+				Base: shared.EditableString{
+					Value:  "base-branch-name",
+					Edited: true,
+				},
+				Assignees: shared.EditableAssignees{
+					EditableSlice: shared.EditableSlice{
+						Add:    []string{"monalisa", "hubot"},
+						Remove: []string{"octocat"},
 						Edited: true,
 					},
-					Body: shared.EditableString{
-						Value:  "new body",
+				},
+				Labels: shared.EditableSlice{
+					Add:    []string{"feature", "TODO", "bug"},
+					Remove: []string{"docs"},
+					Edited: true,
+				},
+				Projects: shared.EditableProjects{
+					EditableSlice: shared.EditableSlice{
+						Add:    []string{"Cleanup", "CleanupV2"},
+						Remove: []string{"Roadmap", "RoadmapV2"},
 						Edited: true,
 					},
-					Base: shared.EditableString{
-						Value:  "base-branch-name",
-						Edited: true,
-					},
-					Assignees: shared.EditableAssignees{
-						EditableSlice: shared.EditableSlice{
-							Add:    []string{"monalisa", "hubot"},
-							Remove: []string{"octocat"},
-							Edited: true,
-						},
-					},
-					Labels: shared.EditableSlice{
-						Add:    []string{"feature", "TODO", "bug"},
-						Remove: []string{"docs"},
-						Edited: true,
-					},
-					Projects: shared.EditableProjects{
-						EditableSlice: shared.EditableSlice{
-							Add:    []string{"Cleanup", "CleanupV2"},
-							Remove: []string{"Roadmap", "RoadmapV2"},
-							Edited: true,
-						},
-					},
-					Milestone: shared.EditableString{
-						Value:  "GA",
-						Edited: true,
-					},
+				},
+				Milestone: shared.EditableString{
+					Value:  "GA",
+					Edited: true,
 				},
 				Fetcher: testFetcher{},
 			},
 			httpStubs: func(t *testing.T, reg *httpmock.Registry) {
-				mockRepoMetadata(reg, mockRepoMetadataOptions{assignees: true, labels: true, projects: true, milestones: true})
+				mockRepoMetadata(reg, mockRepoMetadataOptions{assignees: false, labels: true, projects: true, milestones: true})
 				mockPullRequestUpdate(reg)
-				mockPullRequestUpdateActorAssignees(reg)
+				mockPullRequestUpdateApiActors(reg)
 				mockPullRequestUpdateLabels(reg)
 				mockProjectV2ItemUpdate(reg)
 			},
@@ -501,57 +583,55 @@ func Test_editRun(t *testing.T) {
 					}},
 				}, ghrepo.New("OWNER", "REPO")),
 				Interactive: false,
-				Editable: shared.Editable{
-					Title: shared.EditableString{
-						Value:  "new title",
+				Title: shared.EditableString{
+					Value:  "new title",
+					Edited: true,
+				},
+				Body: shared.EditableString{
+					Value:  "new body",
+					Edited: true,
+				},
+				Base: shared.EditableString{
+					Value:  "base-branch-name",
+					Edited: true,
+				},
+				Reviewers: shared.EditableReviewers{EditableSlice: shared.EditableSlice{
+					Default: []string{"OWNER/core", "OWNER/external", "monalisa", "hubot", "dependabot"},
+					Remove:  []string{"OWNER/core", "OWNER/external", "monalisa", "hubot", "dependabot"},
+					Edited:  true,
+				}},
+				Assignees: shared.EditableAssignees{
+					EditableSlice: shared.EditableSlice{
+						Add:    []string{"monalisa", "hubot"},
+						Remove: []string{"octocat"},
 						Edited: true,
 					},
-					Body: shared.EditableString{
-						Value:  "new body",
+				},
+				Labels: shared.EditableSlice{
+					Add:    []string{"feature", "TODO", "bug"},
+					Remove: []string{"docs"},
+					Edited: true,
+				},
+				Projects: shared.EditableProjects{
+					EditableSlice: shared.EditableSlice{
+						Add:    []string{"Cleanup", "CleanupV2"},
+						Remove: []string{"Roadmap", "RoadmapV2"},
 						Edited: true,
 					},
-					Base: shared.EditableString{
-						Value:  "base-branch-name",
-						Edited: true,
-					},
-					Reviewers: shared.EditableReviewers{EditableSlice: shared.EditableSlice{
-						Default: []string{"OWNER/core", "OWNER/external", "monalisa", "hubot", "dependabot"},
-						Remove:  []string{"OWNER/core", "OWNER/external", "monalisa", "hubot", "dependabot"},
-						Edited:  true,
-					}},
-					Assignees: shared.EditableAssignees{
-						EditableSlice: shared.EditableSlice{
-							Add:    []string{"monalisa", "hubot"},
-							Remove: []string{"octocat"},
-							Edited: true,
-						},
-					},
-					Labels: shared.EditableSlice{
-						Add:    []string{"feature", "TODO", "bug"},
-						Remove: []string{"docs"},
-						Edited: true,
-					},
-					Projects: shared.EditableProjects{
-						EditableSlice: shared.EditableSlice{
-							Add:    []string{"Cleanup", "CleanupV2"},
-							Remove: []string{"Roadmap", "RoadmapV2"},
-							Edited: true,
-						},
-					},
-					Milestone: shared.EditableString{
-						Value:  "GA",
-						Edited: true,
-					},
+				},
+				Milestone: shared.EditableString{
+					Value:  "GA",
+					Edited: true,
 				},
 				Fetcher: testFetcher{},
 			},
 			httpStubs: func(t *testing.T, reg *httpmock.Registry) {
 				// Non-interactive with Remove doesn't need reviewers metadata
-				mockRepoMetadata(reg, mockRepoMetadataOptions{reviewers: false, teamReviewers: false, assignees: true, labels: true, projects: true, milestones: true})
+				mockRepoMetadata(reg, mockRepoMetadataOptions{reviewers: false, teamReviewers: false, assignees: false, labels: true, projects: true, milestones: true})
 				mockPullRequestUpdate(reg)
 				mockRequestReviewsByLogin(reg)
 				mockPullRequestUpdateLabels(reg)
-				mockPullRequestUpdateActorAssignees(reg)
+				mockPullRequestUpdateApiActors(reg)
 				mockProjectV2ItemUpdate(reg)
 			},
 			stdout: "https://github.com/OWNER/REPO/pull/123\n",
@@ -584,13 +664,11 @@ func Test_editRun(t *testing.T) {
 					},
 				}, ghrepo.New("OWNER", "REPO")),
 				Interactive: false,
-				Editable: shared.Editable{
-					Reviewers: shared.EditableReviewers{EditableSlice: shared.EditableSlice{
-						Default: []string{"OWNER/core", "monalisa"},
-						Remove:  []string{"OWNER/core", "monalisa"},
-						Edited:  true,
-					}},
-				},
+				Reviewers: shared.EditableReviewers{EditableSlice: shared.EditableSlice{
+					Default: []string{"OWNER/core", "monalisa"},
+					Remove:  []string{"OWNER/core", "monalisa"},
+					Edited:  true,
+				}},
 				Fetcher: testFetcher{},
 			},
 			httpStubs: func(t *testing.T, reg *httpmock.Registry) {
@@ -600,11 +678,11 @@ func Test_editRun(t *testing.T) {
 					httpmock.GraphQL(`mutation RequestReviewsByLogin\b`),
 					httpmock.GraphQLMutation(`
 					{ "data": { "requestReviewsByLogin": { "clientMutationId": "" } } }`,
-						func(inputs map[string]interface{}) {
+						func(inputs map[string]any) {
 							// Verify that empty slices are sent to properly clear all reviewer types
-							require.Equal(t, []interface{}{}, inputs["userLogins"], "userLogins should be an empty slice")
-							require.Equal(t, []interface{}{}, inputs["botLogins"], "botLogins should be an empty slice")
-							require.Equal(t, []interface{}{}, inputs["teamSlugs"], "teamSlugs should be an empty slice")
+							require.Equal(t, []any{}, inputs["userLogins"], "userLogins should be an empty slice")
+							require.Equal(t, []any{}, inputs["botLogins"], "botLogins should be an empty slice")
+							require.Equal(t, []any{}, inputs["teamSlugs"], "teamSlugs should be an empty slice")
 							require.Equal(t, false, inputs["union"], "union should be false for replace mode")
 						}),
 				)
@@ -619,10 +697,8 @@ func Test_editRun(t *testing.T) {
 				SelectorArg: "123",
 				Finder:      shared.NewMockFinder("123", &api.PullRequest{URL: "https://github.com/OWNER/REPO/pull/123"}, ghrepo.New("OWNER", "REPO")),
 				Interactive: false,
-				Editable: shared.Editable{
-					Reviewers: shared.EditableReviewers{EditableSlice: shared.EditableSlice{Add: []string{"monalisa", "hubot"}, Edited: true}},
-				},
-				Fetcher: testFetcher{},
+				Reviewers:   shared.EditableReviewers{EditableSlice: shared.EditableSlice{Add: []string{"monalisa", "hubot"}, Edited: true}},
+				Fetcher:     testFetcher{},
 			},
 			httpStubs: func(t *testing.T, reg *httpmock.Registry) {
 				// Non-interactive with Add/Remove doesn't need reviewer metadata
@@ -641,10 +717,8 @@ func Test_editRun(t *testing.T) {
 				SelectorArg: "123",
 				Finder:      shared.NewMockFinder("123", &api.PullRequest{URL: "https://github.com/OWNER/REPO/pull/123"}, ghrepo.New("OWNER", "REPO")),
 				Interactive: false,
-				Editable: shared.Editable{
-					Reviewers: shared.EditableReviewers{EditableSlice: shared.EditableSlice{Add: []string{"monalisa", "OWNER/core"}, Edited: true}},
-				},
-				Fetcher: testFetcher{},
+				Reviewers:   shared.EditableReviewers{EditableSlice: shared.EditableSlice{Add: []string{"monalisa", "OWNER/core"}, Edited: true}},
+				Fetcher:     testFetcher{},
 			},
 			httpStubs: func(t *testing.T, reg *httpmock.Registry) {
 				// Non-interactive with Add/Remove doesn't need reviewer metadata
@@ -668,10 +742,8 @@ func Test_editRun(t *testing.T) {
 					{RequestedReviewer: api.RequestedReviewer{TypeName: "User", Login: "monalisa"}},
 				}}}, ghrepo.New("OWNER", "REPO")),
 				Interactive: false,
-				Editable: shared.Editable{
-					Reviewers: shared.EditableReviewers{EditableSlice: shared.EditableSlice{Remove: []string{"monalisa", "OWNER/core"}, Edited: true}},
-				},
-				Fetcher: testFetcher{},
+				Reviewers:   shared.EditableReviewers{EditableSlice: shared.EditableSlice{Remove: []string{"monalisa", "OWNER/core"}, Edited: true}},
+				Fetcher:     testFetcher{},
 			},
 			httpStubs: func(t *testing.T, reg *httpmock.Registry) {
 				// Non-interactive with Add/Remove doesn't need reviewer metadata
@@ -690,10 +762,8 @@ func Test_editRun(t *testing.T) {
 				SelectorArg: "123",
 				Finder:      shared.NewMockFinder("123", &api.PullRequest{URL: "https://github.com/OWNER/REPO/pull/123"}, ghrepo.New("OWNER", "REPO")),
 				Interactive: false,
-				Editable: shared.Editable{
-					Reviewers: shared.EditableReviewers{EditableSlice: shared.EditableSlice{Add: []string{"monalisa"}, Remove: []string{"hubot"}, Default: []string{"OWNER/core"}, Edited: true}},
-				},
-				Fetcher: testFetcher{},
+				Reviewers:   shared.EditableReviewers{EditableSlice: shared.EditableSlice{Add: []string{"monalisa"}, Remove: []string{"hubot"}, Default: []string{"OWNER/core"}, Edited: true}},
+				Fetcher:     testFetcher{},
 			},
 			httpStubs: func(t *testing.T, reg *httpmock.Registry) {
 				// Non-interactive with Add/Remove doesn't need reviewer metadata
@@ -756,7 +826,7 @@ func Test_editRun(t *testing.T) {
 				// (searchFunc handles dynamic fetching, metadata populated in test mock)
 				mockRepoMetadata(reg, mockRepoMetadataOptions{reviewers: false, teamReviewers: false, assignees: false, labels: true, projects: true, milestones: true})
 				mockPullRequestUpdate(reg)
-				mockPullRequestUpdateActorAssignees(reg)
+				mockPullRequestUpdateApiActors(reg)
 				mockRequestReviewsByLogin(reg)
 				mockPullRequestUpdateLabels(reg)
 				mockProjectV2ItemUpdate(reg)
@@ -785,7 +855,7 @@ func Test_editRun(t *testing.T) {
 					editFields: func(e *shared.Editable, _ string) error {
 						e.Title.Value = "new title"
 						e.Body.Value = "new body"
-						// When ActorAssignees is enabled, the interactive flow returns display names (or logins for non-users)
+						// When ApiActorsSupported is enabled, the interactive flow returns display names (or logins for non-users)
 						e.Assignees.Value = []string{"monalisa (Mona Display Name)", "hubot"}
 						// Populate metadata to simulate what searchFunc would do during prompting
 						e.Metadata.AssignableActors = []api.AssignableActor{
@@ -808,7 +878,7 @@ func Test_editRun(t *testing.T) {
 				// assignees: false because searchFunc handles dynamic fetching (metadata populated in test mock)
 				mockRepoMetadata(reg, mockRepoMetadataOptions{assignees: false, labels: true, projects: true, milestones: true})
 				mockPullRequestUpdate(reg)
-				mockPullRequestUpdateActorAssignees(reg)
+				mockPullRequestUpdateApiActors(reg)
 				mockPullRequestUpdateLabels(reg)
 				mockProjectV2ItemUpdate(reg)
 			},
@@ -876,7 +946,7 @@ func Test_editRun(t *testing.T) {
 				mockRepoMetadata(reg, mockRepoMetadataOptions{reviewers: false, teamReviewers: false, assignees: false, labels: true, projects: true, milestones: true})
 				mockPullRequestUpdate(reg)
 				mockRequestReviewsByLogin(reg)
-				mockPullRequestUpdateActorAssignees(reg)
+				mockPullRequestUpdateApiActors(reg)
 				mockPullRequestUpdateLabels(reg)
 				mockProjectV2ItemUpdate(reg)
 			},
@@ -912,12 +982,8 @@ func Test_editRun(t *testing.T) {
 						require.Equal(t, []string{"hubot"}, e.Assignees.DefaultLogins)
 
 						// Adding monalisa as PR assignee, should preserve hubot.
-						e.Assignees.Value = []string{"hubot", "monalisa (Mona Display Name)"}
-						// Populate metadata to simulate what searchFunc would do during prompting
-						e.Metadata.AssignableActors = []api.AssignableActor{
-							api.NewAssignableBot("HUBOTID", "hubot"),
-							api.NewAssignableUser("MONAID", "monalisa", "Mona Display Name"),
-						}
+						// MultiSelectWithSearch returns Keys (logins), not display names.
+						e.Assignees.Value = []string{"hubot", "monalisa"}
 						return nil
 					},
 				},
@@ -930,11 +996,8 @@ func Test_editRun(t *testing.T) {
 					httpmock.GraphQL(`mutation ReplaceActorsForAssignable\b`),
 					httpmock.GraphQLMutation(`
 					{ "data": { "replaceActorsForAssignable": { "__typename": "" } } }`,
-						func(inputs map[string]interface{}) {
-							// Checking that despite the display name being returned
-							// from the EditFieldsSurvey, the ID is still
-							// used in the mutation.
-							require.Subset(t, inputs["actorIds"], []string{"MONAID", "HUBOTID"})
+						func(inputs map[string]any) {
+							require.Subset(t, inputs["actorLogins"], []any{"hubot", "monalisa"})
 						}),
 				)
 			},
@@ -949,13 +1012,11 @@ func Test_editRun(t *testing.T) {
 					URL: "https://github.com/OWNER/REPO/pull/123",
 				}, ghrepo.New("OWNER", "REPO")),
 				Interactive: false,
-				Editable: shared.Editable{
-					Assignees: shared.EditableAssignees{
-						EditableSlice: shared.EditableSlice{
-							Add:    []string{"monalisa", "hubot"},
-							Remove: []string{"octocat"},
-							Edited: true,
-						},
+				Assignees: shared.EditableAssignees{
+					EditableSlice: shared.EditableSlice{
+						Add:    []string{"monalisa", "hubot"},
+						Remove: []string{"octocat"},
+						Edited: true,
 					},
 				},
 				Fetcher: testFetcher{},
@@ -997,7 +1058,7 @@ func Test_editRun(t *testing.T) {
 						return nil
 					},
 					editFields: func(e *shared.Editable, _ string) error {
-						require.False(t, e.Assignees.ActorAssignees)
+						require.False(t, e.ApiActorsSupported)
 						require.Nil(t, e.AssigneeSearchFunc)
 						require.Contains(t, e.Assignees.Options, "monalisa")
 						require.Contains(t, e.Assignees.Options, "hubot")
@@ -1108,13 +1169,11 @@ func Test_editRun(t *testing.T) {
 					URL: "https://github.com/OWNER/REPO/pull/123",
 				}, ghrepo.New("OWNER", "REPO")),
 				Interactive: false,
-				Editable: shared.Editable{
-					Projects: shared.EditableProjects{
-						EditableSlice: shared.EditableSlice{
-							Add:    []string{"CleanupV2"},
-							Remove: []string{"RoadmapV2"},
-							Edited: true,
-						},
+				Projects: shared.EditableProjects{
+					EditableSlice: shared.EditableSlice{
+						Add:    []string{"CleanupV2"},
+						Remove: []string{"RoadmapV2"},
+						Edited: true,
 					},
 				},
 				Fetcher: testFetcher{},
@@ -1160,6 +1219,434 @@ func Test_editRun(t *testing.T) {
 			},
 			stdout: "https://github.com/OWNER/REPO/pull/123\n",
 		},
+		{
+			name: "cancelling the editor uploads nothing",
+			input: &EditOptions{
+				Detector:    &fd.EnabledDetectorMock{},
+				SelectorArg: "123",
+				Finder: shared.NewMockFinder("123", &api.PullRequest{
+					URL:        "https://github.com/OWNER/REPO/pull/123",
+					Body:       "the original body",
+					Repository: &api.PRRepository{DatabaseID: 1234, ViewerPermission: "WRITE"},
+				}, ghrepo.New("OWNER", "REPO")),
+				Interactive: true,
+				Surveyor: testSurveyor{
+					fieldsToEdit: func(e *shared.Editable) error {
+						e.Body.Edited = true
+						return nil
+					},
+					editFields: func(e *shared.Editable, editorCmd string) error {
+						return errors.New("the user quit the editor")
+					},
+				},
+				Fetcher:         testFetcher{},
+				EditorRetriever: testEditorRetriever{},
+			},
+			attach: []string{"shot.png"},
+			httpStubs: func(t *testing.T, reg *httpmock.Registry) {
+				reg.Exclude(t, httpmock.REST("POST", "user-attachments/assets"))
+			},
+			wantErr: "the user quit the editor",
+		},
+		{
+			name: "a permission that cannot upload fails before any prompt",
+			input: &EditOptions{
+				Detector:    &fd.EnabledDetectorMock{},
+				SelectorArg: "123",
+				Finder: shared.NewMockFinder("123", &api.PullRequest{
+					URL:        "https://github.com/OWNER/REPO/pull/123",
+					Body:       "the original body",
+					Repository: &api.PRRepository{DatabaseID: 1234, ViewerPermission: "READ"},
+				}, ghrepo.New("OWNER", "REPO")),
+				Interactive:     true,
+				Surveyor:        testSurveyor{},
+				Fetcher:         testFetcher{},
+				EditorRetriever: testEditorRetriever{},
+			},
+			attach:  []string{"shot.png"},
+			wantErr: "attaching files requires write access to the repository",
+		},
+		{
+			name: "attaching with no body flag keeps the body already on the pull request",
+			input: &EditOptions{
+				Detector:    &fd.EnabledDetectorMock{},
+				SelectorArg: "123",
+				Finder: shared.NewMockFinder("123", &api.PullRequest{
+					URL:        "https://github.com/OWNER/REPO/pull/123",
+					Body:       "the original body",
+					Repository: &api.PRRepository{DatabaseID: 1234, ViewerPermission: "WRITE"},
+				}, ghrepo.New("OWNER", "REPO")),
+				Interactive: false,
+				Fetcher:     testFetcher{},
+			},
+			attach:  []string{"shot.png"},
+			uploads: []attachments.UploadStub{{Name: "shot.png", Status: 201, Body: `{"url":"https://example.com/1"}`}},
+			httpStubs: func(t *testing.T, reg *httpmock.Registry) {
+				mockPullRequestUpdateWithBody(t, reg, "the original body\n\n![shot](https://example.com/1)")
+			},
+			stdout:         "https://github.com/OWNER/REPO/pull/123\n",
+			wantOperations: &attachments.UploadResult{AppendOperations: 1},
+		},
+		{
+			name: "an empty body flag clears the body and leaves the attachment",
+			input: &EditOptions{
+				Detector:    &fd.EnabledDetectorMock{},
+				SelectorArg: "123",
+				Finder: shared.NewMockFinder("123", &api.PullRequest{
+					URL:        "https://github.com/OWNER/REPO/pull/123",
+					Body:       "the original body",
+					Repository: &api.PRRepository{DatabaseID: 1234, ViewerPermission: "WRITE"},
+				}, ghrepo.New("OWNER", "REPO")),
+				Interactive: false,
+				Body: shared.EditableString{
+					Value:  "",
+					Edited: true,
+				},
+				Fetcher: testFetcher{},
+			},
+			attach:  []string{"shot.png"},
+			uploads: []attachments.UploadStub{{Name: "shot.png", Status: 201, Body: `{"url":"https://example.com/1"}`}},
+			httpStubs: func(t *testing.T, reg *httpmock.Registry) {
+				mockPullRequestUpdateWithBody(t, reg, "![shot](https://example.com/1)")
+			},
+			stdout: "https://github.com/OWNER/REPO/pull/123\n",
+		},
+		{
+			name: "attaching rewrites a reference relative to the body file",
+			input: &EditOptions{
+				Detector:    &fd.EnabledDetectorMock{},
+				SelectorArg: "123",
+				Finder: shared.NewMockFinder("123", &api.PullRequest{
+					URL:        "https://github.com/OWNER/REPO/pull/123",
+					Body:       "the original body",
+					Repository: &api.PRRepository{DatabaseID: 1234, ViewerPermission: "WRITE"},
+				}, ghrepo.New("OWNER", "REPO")),
+				Interactive: false,
+				Body: shared.EditableString{
+					Value:  "the plan ![diagram](./diagram.png)",
+					Edited: true,
+				},
+				BodyDir: "docs",
+				Fetcher: testFetcher{},
+			},
+			attach:  []string{"docs/diagram.png"},
+			uploads: []attachments.UploadStub{{Name: "diagram.png", Status: 201, Body: `{"url":"https://example.com/1"}`}},
+			httpStubs: func(t *testing.T, reg *httpmock.Registry) {
+				mockPullRequestUpdateWithBody(t, reg, "the plan ![diagram](https://example.com/1)")
+			},
+			stdout:         "https://github.com/OWNER/REPO/pull/123\n",
+			wantOperations: &attachments.UploadResult{ReplaceOperations: 1},
+		},
+		{
+			name: "attaching does not double what the editor already carried",
+			input: &EditOptions{
+				Detector:    &fd.EnabledDetectorMock{},
+				SelectorArg: "123",
+				Finder: shared.NewMockFinder("123", &api.PullRequest{
+					URL:        "https://github.com/OWNER/REPO/pull/123",
+					Body:       "the original body",
+					Repository: &api.PRRepository{DatabaseID: 1234, ViewerPermission: "WRITE"},
+				}, ghrepo.New("OWNER", "REPO")),
+				Interactive: true,
+				Surveyor: testSurveyor{
+					fieldsToEdit: func(e *shared.Editable) error {
+						e.Body.Edited = true
+						return nil
+					},
+					editFields: func(e *shared.Editable, editorCmd string) error {
+						e.Body.Value = e.Body.Default + "\n\nplus an edit"
+						return nil
+					},
+				},
+				Fetcher:         testFetcher{},
+				EditorRetriever: testEditorRetriever{},
+			},
+			attach:  []string{"shot.png"},
+			uploads: []attachments.UploadStub{{Name: "shot.png", Status: 201, Body: `{"url":"https://example.com/1"}`}},
+			httpStubs: func(t *testing.T, reg *httpmock.Registry) {
+				mockPullRequestUpdateWithBody(t, reg, "the original body\n\nplus an edit\n\n![shot](https://example.com/1)")
+			},
+			stdout: "https://github.com/OWNER/REPO/pull/123\n",
+		},
+		{
+			name: "an upload that partly succeeded writes the part that uploaded",
+			input: &EditOptions{
+				Detector:    &fd.EnabledDetectorMock{},
+				SelectorArg: "123",
+				Finder: shared.NewMockFinder("123", &api.PullRequest{
+					URL:        "https://github.com/OWNER/REPO/pull/123",
+					Body:       "the original body",
+					Repository: &api.PRRepository{DatabaseID: 1234, ViewerPermission: "WRITE"},
+				}, ghrepo.New("OWNER", "REPO")),
+				Interactive: false,
+				Fetcher:     testFetcher{},
+			},
+			attach: []string{"a.png", "b.png"},
+			uploads: []attachments.UploadStub{
+				{Name: "a.png", Status: 201, Body: `{"url":"https://example.com/1"}`},
+				{Name: "b.png", Status: 404, Body: `{"message":"Not Found"}`},
+			},
+			httpStubs: func(t *testing.T, reg *httpmock.Registry) {
+				mockPullRequestUpdateWithBody(t, reg, "the original body\n\n![a](https://example.com/1)")
+			},
+			stdout:         "https://github.com/OWNER/REPO/pull/123\n",
+			wantErr:        "could not upload ./b.png: attaching files requires write access to the repository",
+			wantOperations: &attachments.UploadResult{AppendOperations: 1},
+		},
+		{
+			name: "a sole failed upload leaves the body alone and still edits the title",
+			input: &EditOptions{
+				Detector:    &fd.EnabledDetectorMock{},
+				SelectorArg: "123",
+				Finder: shared.NewMockFinder("123", &api.PullRequest{
+					URL:        "https://github.com/OWNER/REPO/pull/123",
+					Body:       "the original body",
+					Repository: &api.PRRepository{DatabaseID: 1234, ViewerPermission: "WRITE"},
+				}, ghrepo.New("OWNER", "REPO")),
+				Interactive: false,
+				Title:       shared.EditableString{Value: "new title", Edited: true},
+				Fetcher:     testFetcher{},
+			},
+			attach:  []string{"a.png"},
+			uploads: []attachments.UploadStub{{Name: "a.png", Status: 404, Body: `{"message":"Not Found"}`}},
+			httpStubs: func(t *testing.T, reg *httpmock.Registry) {
+				mockPullRequestUpdateWithoutBody(t, reg, "new title")
+			},
+			stdout:  "https://github.com/OWNER/REPO/pull/123\n",
+			wantErr: "could not upload ./a.png: attaching files requires write access to the repository",
+		},
+		{
+			name: "a validation failure leaves the body alone and still edits the title",
+			input: &EditOptions{
+				Detector:    &fd.EnabledDetectorMock{},
+				SelectorArg: "123",
+				Finder: shared.NewMockFinder("123", &api.PullRequest{
+					URL:        "https://github.com/OWNER/REPO/pull/123",
+					Body:       "important work\n\n![demo][d]\n\n[d]: ./demo.mp4",
+					Repository: &api.PRRepository{DatabaseID: 1234, ViewerPermission: "WRITE"},
+				}, ghrepo.New("OWNER", "REPO")),
+				Interactive: false,
+				Title:       shared.EditableString{Value: "new title", Edited: true},
+				Fetcher:     testFetcher{},
+			},
+			attach: []string{"demo.mp4"},
+			httpStubs: func(t *testing.T, reg *httpmock.Registry) {
+				reg.Exclude(t, httpmock.REST("POST", "user-attachments/assets"))
+				mockPullRequestUpdateWithoutBody(t, reg, "new title")
+			},
+			stdout:  "https://github.com/OWNER/REPO/pull/123\n",
+			wantErr: "cannot embed a video as a reference-style image: ./demo.mp4",
+		},
+		{
+			name: "an attach that writes nothing does not print the URL",
+			input: &EditOptions{
+				Detector:    &fd.EnabledDetectorMock{},
+				SelectorArg: "123",
+				Finder: shared.NewMockFinder("123", &api.PullRequest{
+					URL:        "https://github.com/OWNER/REPO/pull/123",
+					Body:       "the original body",
+					Repository: &api.PRRepository{DatabaseID: 1234, ViewerPermission: "WRITE"},
+				}, ghrepo.New("OWNER", "REPO")),
+				Interactive: false,
+				Fetcher:     testFetcher{},
+			},
+			attach:  []string{"a.png"},
+			uploads: []attachments.UploadStub{{Name: "a.png", Status: 404, Body: `{"message":"Not Found"}`}},
+			httpStubs: func(t *testing.T, reg *httpmock.Registry) {
+				reg.Exclude(t, httpmock.GraphQL(`mutation PullRequestUpdate\b`))
+			},
+			wantErr: "could not upload ./a.png: attaching files requires write access to the repository\nthe pull request was not changed",
+		},
+		{
+			name: "an upload failure and a write failure are both reported",
+			input: &EditOptions{
+				Detector:    &fd.EnabledDetectorMock{},
+				SelectorArg: "123",
+				Finder: shared.NewMockFinder("123", &api.PullRequest{
+					URL:        "https://github.com/OWNER/REPO/pull/123",
+					Body:       "the original body",
+					Repository: &api.PRRepository{DatabaseID: 1234, ViewerPermission: "WRITE"},
+				}, ghrepo.New("OWNER", "REPO")),
+				Interactive: false,
+				Title:       shared.EditableString{Value: "new title", Edited: true},
+				Fetcher:     testFetcher{},
+			},
+			attach:  []string{"a.png"},
+			uploads: []attachments.UploadStub{{Name: "a.png", Status: 404, Body: `{"message":"Not Found"}`}},
+			httpStubs: func(t *testing.T, reg *httpmock.Registry) {
+				reg.Register(
+					httpmock.GraphQL(`mutation PullRequestUpdate\b`),
+					httpmock.StatusStringResponse(500, `{"message":"the write failed"}`),
+				)
+			},
+			wantErr: "could not upload ./a.png: attaching files requires write access to the repository\nnon-200 OK status code:  body: \"{\\\"message\\\":\\\"the write failed\\\"}\"",
+		},
+		{
+			// This predates --attach, which is why the not-changed message the
+			// row above covers is guarded on something being attached.
+			name: "an interactive run that selects nothing still prints the URL",
+			input: &EditOptions{
+				Detector:    &fd.EnabledDetectorMock{},
+				SelectorArg: "123",
+				Finder: shared.NewMockFinder("123", &api.PullRequest{
+					URL:  "https://github.com/OWNER/REPO/pull/123",
+					Body: "the original body",
+				}, ghrepo.New("OWNER", "REPO")),
+				Interactive: true,
+				Surveyor: testSurveyor{
+					fieldsToEdit: func(e *shared.Editable) error { return nil },
+					editFields:   func(e *shared.Editable, editorCmd string) error { return nil },
+				},
+				Fetcher:         testFetcher{},
+				EditorRetriever: testEditorRetriever{},
+			},
+			httpStubs: func(t *testing.T, reg *httpmock.Registry) {
+				reg.Exclude(t, httpmock.GraphQL(`mutation PullRequestUpdate\b`))
+			},
+			stdout: "https://github.com/OWNER/REPO/pull/123\n",
+		},
+		{
+			name: "a failed upload drops even a body the caller typed",
+			input: &EditOptions{
+				Detector:    &fd.EnabledDetectorMock{},
+				SelectorArg: "123",
+				Finder: shared.NewMockFinder("123", &api.PullRequest{
+					URL:        "https://github.com/OWNER/REPO/pull/123",
+					Body:       "the original body",
+					Repository: &api.PRRepository{DatabaseID: 1234, ViewerPermission: "WRITE"},
+				}, ghrepo.New("OWNER", "REPO")),
+				Interactive: false,
+				Title:       shared.EditableString{Value: "new title", Edited: true},
+				Body:        shared.EditableString{Value: "see ![a](./a.png)", Edited: true},
+				Fetcher:     testFetcher{},
+			},
+			attach:  []string{"a.png"},
+			uploads: []attachments.UploadStub{{Name: "a.png", Status: 404, Body: `{"message":"Not Found"}`}},
+			httpStubs: func(t *testing.T, reg *httpmock.Registry) {
+				mockPullRequestUpdateWithoutBody(t, reg, "new title")
+			},
+			stdout:  "https://github.com/OWNER/REPO/pull/123\n",
+			wantErr: "could not upload ./a.png: attaching files requires write access to the repository",
+		},
+		{
+			name: "the upload goes to the host the pull request was fetched from",
+			input: &EditOptions{
+				Detector:    &fd.EnabledDetectorMock{},
+				SelectorArg: "https://acme.ghe.com/OWNER/REPO/pull/123",
+				Finder: shared.NewMockFinder("https://acme.ghe.com/OWNER/REPO/pull/123", &api.PullRequest{
+					URL:        "https://acme.ghe.com/OWNER/REPO/pull/123",
+					Body:       "the original body",
+					Repository: &api.PRRepository{DatabaseID: 1234, ViewerPermission: "WRITE"},
+				}, ghrepo.NewWithHost("OWNER", "REPO", "acme.ghe.com")),
+				Interactive: false,
+				Fetcher:     testFetcher{},
+			},
+			attach:         []string{"shot.png"},
+			uploads:        []attachments.UploadStub{{Name: "shot.png", Status: 201, Body: `{"url":"https://example.com/1"}`}},
+			wantUploadHost: "uploads.acme.ghe.com",
+			httpStubs: func(t *testing.T, reg *httpmock.Registry) {
+				mockPullRequestUpdateWithBody(t, reg, "the original body\n\n![shot](https://example.com/1)")
+			},
+			stdout: "https://acme.ghe.com/OWNER/REPO/pull/123\n",
+		},
+		{
+			name: "a missing repository id stops the upload",
+			input: &EditOptions{
+				Detector:    &fd.EnabledDetectorMock{},
+				SelectorArg: "123",
+				Finder: shared.NewMockFinder("123", &api.PullRequest{
+					URL:        "https://github.com/OWNER/REPO/pull/123",
+					Repository: &api.PRRepository{DatabaseID: 0, ViewerPermission: "WRITE"},
+				}, ghrepo.New("OWNER", "REPO")),
+				Interactive: false,
+				Fetcher:     testFetcher{},
+			},
+			attach:  []string{"shot.png"},
+			wantErr: "could not determine which repository to attach files to",
+		},
+		{
+			name: "read access stops the upload",
+			input: &EditOptions{
+				Detector:    &fd.EnabledDetectorMock{},
+				SelectorArg: "123",
+				Finder: shared.NewMockFinder("123", &api.PullRequest{
+					URL:        "https://github.com/OWNER/REPO/pull/123",
+					Body:       "the original body",
+					Repository: &api.PRRepository{DatabaseID: 1234, ViewerPermission: "READ"},
+				}, ghrepo.New("OWNER", "REPO")),
+				Interactive: false,
+				Fetcher:     testFetcher{},
+			},
+			attach:  []string{"shot.png"},
+			wantErr: "attaching files requires write access to the repository",
+		},
+		{
+			name: "attaching asks the pull request lookup for the repository id",
+			input: &EditOptions{
+				Detector:    &fd.EnabledDetectorMock{},
+				SelectorArg: "123",
+				Finder: shared.NewMockFinder("123", &api.PullRequest{
+					URL:        "https://github.com/OWNER/REPO/pull/123",
+					Body:       "the original body",
+					Repository: &api.PRRepository{DatabaseID: 1234, ViewerPermission: "WRITE"},
+				}, ghrepo.New("OWNER", "REPO")),
+				Interactive: false,
+				Fetcher:     testFetcher{},
+			},
+			attach:  []string{"shot.png"},
+			uploads: []attachments.UploadStub{{Name: "shot.png", Status: 201, Body: `{"url":"https://example.com/1"}`}},
+			httpStubs: func(t *testing.T, reg *httpmock.Registry) {
+				mockPullRequestUpdate(reg)
+			},
+			wantLookupFields: []string{"repository"},
+			stdout:           "https://github.com/OWNER/REPO/pull/123\n",
+		},
+		{
+			name: "a run that attaches nothing does not write the body",
+			input: &EditOptions{
+				Detector:    &fd.EnabledDetectorMock{},
+				SelectorArg: "123",
+				Finder: shared.NewMockFinder("123", &api.PullRequest{
+					URL:  "https://github.com/OWNER/REPO/pull/123",
+					Body: "the original body",
+				}, ghrepo.New("OWNER", "REPO")),
+				Interactive: false,
+				Labels: shared.EditableSlice{
+					Add:    []string{"bug"},
+					Remove: []string{"docs"},
+					Edited: true,
+				},
+				Fetcher: testFetcher{},
+			},
+			httpStubs: func(t *testing.T, reg *httpmock.Registry) {
+				reg.Exclude(t, httpmock.GraphQL(`mutation PullRequestUpdate\b`))
+				mockRepoMetadata(reg, mockRepoMetadataOptions{labels: true})
+				mockPullRequestUpdateLabels(reg)
+			},
+			stdout: "https://github.com/OWNER/REPO/pull/123\n",
+		},
+		{
+			name: "the lookup does not ask for the repository id without an attachment",
+			input: &EditOptions{
+				Detector:    &fd.EnabledDetectorMock{},
+				SelectorArg: "123",
+				Finder: shared.NewMockFinder("123", &api.PullRequest{
+					URL:  "https://github.com/OWNER/REPO/pull/123",
+					Body: "the original body",
+				}, ghrepo.New("OWNER", "REPO")),
+				Interactive: false,
+				Title: shared.EditableString{
+					Value:  "new title",
+					Edited: true,
+				},
+				Fetcher: testFetcher{},
+			},
+			httpStubs: func(t *testing.T, reg *httpmock.Registry) {
+				mockPullRequestUpdate(reg)
+			},
+			wantNoLookupFields: []string{"repository"},
+			stdout:             "https://github.com/OWNER/REPO/pull/123\n",
+		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -1170,7 +1657,16 @@ func Test_editRun(t *testing.T) {
 
 			reg := &httpmock.Registry{}
 			defer reg.Verify(t)
-			tt.httpStubs(t, reg)
+			for _, u := range tt.uploads {
+				if tt.wantUploadHost != "" {
+					attachments.StubUploadToHost(t, reg, tt.wantUploadHost, 1234, u.Name, u.Status, u.Body)
+					continue
+				}
+				attachments.StubUpload(reg, 1234, u.Name, u.Status, u.Body)
+			}
+			if tt.httpStubs != nil {
+				tt.httpStubs(t, reg)
+			}
 
 			httpClient := func() (*http.Client, error) { return &http.Client{Transport: reg}, nil }
 			baseRepo := func() (ghrepo.Interface, error) { return ghrepo.New("OWNER", "REPO"), nil }
@@ -1179,12 +1675,54 @@ func Test_editRun(t *testing.T) {
 			tt.input.HttpClient = httpClient
 			tt.input.BaseRepo = baseRepo
 
+			// NewTestAssets moves into a temporary directory, so it runs before
+			// anything else reads a relative path.
+			if len(tt.attach) > 0 {
+				tt.input.Assets = attachments.NewTestAssets(t, tt.attach...)
+			}
+			// Given a pending event when operation counts are under test
+			attachmentRecorder := &telemetry.InvocationRecorderSpy{}
+			if tt.wantOperations != nil {
+				tt.input.AttachEvent = attachments.BeginTelemetry(attachmentRecorder, "gh test", len(tt.attach))
+			}
+
+			var lookupFields []string
+			tt.input.Finder = fieldCapturingFinder{PRFinder: tt.input.Finder, fields: &lookupFields}
+
+			// When pull request editing runs
 			err := editRun(tt.input)
-			assert.NoError(t, err)
+			if tt.wantOperations != nil {
+				// Then telemetry retains completed operations, including partial results
+				attachments.AssertTestTelemetryEvents(t, attachmentRecorder.Events(), len(tt.attach), *tt.wantOperations)
+			}
+			if tt.wantErr != "" {
+				require.EqualError(t, err, tt.wantErr)
+			} else {
+				require.NoError(t, err)
+			}
 			assert.Equal(t, tt.stdout, stdout.String())
 			assert.Equal(t, tt.stderr, stderr.String())
+
+			for _, field := range tt.wantLookupFields {
+				assert.Contains(t, lookupFields, field)
+			}
+			for _, field := range tt.wantNoLookupFields {
+				assert.NotContains(t, lookupFields, field)
+			}
 		})
 	}
+}
+
+// fieldCapturingFinder records the fields a run asks the pull request lookup
+// for, then delegates to the finder it wraps.
+type fieldCapturingFinder struct {
+	shared.PRFinder
+	fields *[]string
+}
+
+func (f fieldCapturingFinder) Find(opts shared.FindOptions) (*api.PullRequest, ghrepo.Interface, error) {
+	*f.fields = opts.Fields
+	return f.PRFinder.Find(opts)
 }
 
 type mockRepoMetadataOptions struct {
@@ -1197,7 +1735,7 @@ type mockRepoMetadataOptions struct {
 }
 
 func mockRepoMetadata(reg *httpmock.Registry, opt mockRepoMetadataOptions) {
-	// Assignable actors (users/bots) are fetched when reviewers OR assignees edited with ActorAssignees enabled.
+	// Assignable actors (users/bots) are fetched when reviewers OR assignees edited with ApiActorsSupported enabled.
 	if opt.reviewers || opt.assignees {
 		reg.Register(
 			httpmock.GraphQL(`query RepositoryAssignableActors\b`),
@@ -1321,12 +1859,33 @@ func mockPullRequestUpdate(reg *httpmock.Registry) {
 		httpmock.StringResponse(`{}`))
 }
 
-func mockPullRequestUpdateActorAssignees(reg *httpmock.Registry) {
+func mockPullRequestUpdateWithBody(t *testing.T, reg *httpmock.Registry, wantBody string) {
+	reg.Register(
+		httpmock.GraphQL(`mutation PullRequestUpdate\b`),
+		httpmock.GraphQLMutation(`{}`, func(inputs map[string]any) {
+			assert.Equal(t, wantBody, inputs["body"])
+		}),
+	)
+}
+
+// A dropped body is absent from the input, which is not the same as a body sent
+// with its old value.
+func mockPullRequestUpdateWithoutBody(t *testing.T, reg *httpmock.Registry, wantTitle string) {
+	reg.Register(
+		httpmock.GraphQL(`mutation PullRequestUpdate\b`),
+		httpmock.GraphQLMutation(`{}`, func(inputs map[string]any) {
+			assert.Equal(t, wantTitle, inputs["title"])
+			assert.NotContains(t, inputs, "body")
+		}),
+	)
+}
+
+func mockPullRequestUpdateApiActors(reg *httpmock.Registry) {
 	reg.Register(
 		httpmock.GraphQL(`mutation ReplaceActorsForAssignable\b`),
 		httpmock.GraphQLMutation(`
 		{ "data": { "replaceActorsForAssignable": { "__typename": "" } } }`,
-			func(inputs map[string]interface{}) {}),
+			func(inputs map[string]any) {}),
 	)
 }
 
@@ -1343,13 +1902,13 @@ func mockPullRequestRemoveReviewers(reg *httpmock.Registry) {
 }
 
 // mockRequestReviewsByLogin mocks the RequestReviewsByLogin GraphQL mutation
-// used on github.com when ActorAssignees is enabled.
+// used on github.com when ApiActorsSupported is enabled.
 func mockRequestReviewsByLogin(reg *httpmock.Registry) {
 	reg.Register(
 		httpmock.GraphQL(`mutation RequestReviewsByLogin\b`),
 		httpmock.GraphQLMutation(`
 		{ "data": { "requestReviewsByLogin": { "clientMutationId": "" } } }`,
-			func(inputs map[string]interface{}) {}),
+			func(inputs map[string]any) {}),
 	)
 }
 
@@ -1358,13 +1917,13 @@ func mockPullRequestUpdateLabels(reg *httpmock.Registry) {
 		httpmock.GraphQL(`mutation LabelAdd\b`),
 		httpmock.GraphQLMutation(`
 		{ "data": { "addLabelsToLabelable": { "__typename": "" } } }`,
-			func(inputs map[string]interface{}) {}),
+			func(inputs map[string]any) {}),
 	)
 	reg.Register(
 		httpmock.GraphQL(`mutation LabelRemove\b`),
 		httpmock.GraphQLMutation(`
 		{ "data": { "removeLabelsFromLabelable": { "__typename": "" } } }`,
-			func(inputs map[string]interface{}) {}),
+			func(inputs map[string]any) {}),
 	)
 }
 
@@ -1373,7 +1932,7 @@ func mockProjectV2ItemUpdate(reg *httpmock.Registry) {
 		httpmock.GraphQL(`mutation UpdateProjectV2Items\b`),
 		httpmock.GraphQLMutation(`
 		{ "data": { "add_000": { "item": { "id": "1" } }, "delete_001": { "item": { "id": "2" } } } }`,
-			func(inputs map[string]interface{}) {}),
+			func(inputs map[string]any) {}),
 	)
 }
 
